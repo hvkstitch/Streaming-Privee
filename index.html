@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MaCinémathèque</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">Ma<span>Cinémathèque</span></div>
+  <div class="stats">
+    <div><strong id="stat-count">0</strong>Films</div>
+    <div><strong id="stat-size">0 MB</strong>Stockage</div>
+  </div>
+</header>
+
+<nav>
+  <button class="tab active" onclick="switchTab('library', this)">📽 Bibliothèque</button>
+  <button class="tab" onclick="switchTab('upload', this)">⬆ Ajouter</button>
+</nav>
+
+<div class="container">
+
+  <!-- UPLOAD TAB -->
+  <div id="tab-upload" class="tab-content">
+    <div class="upload-zone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+      <span class="upload-icon">🎬</span>
+      <h2>Déposer vos films ici</h2>
+      <p>
+        Glissez-déposez vos fichiers vidéo ou cliquez pour sélectionner<br>
+        Tous vos films restent stockés localement sur votre appareil
+      </p>
+      <div class="formats">
+        <span class="badge">MP4</span>
+        <span class="badge">MKV</span>
+        <span class="badge">AVI</span>
+        <span class="badge">MOV</span>
+        <span class="badge">WMV</span>
+        <span class="badge">FLV</span>
+        <span class="badge">WEBM</span>
+        <span class="badge">M4V</span>
+        <span class="badge">TS</span>
+        <span class="badge">MPG</span>
+      </div>
+    </div>
+    <input
+      type="file"
+      id="fileInput"
+      accept="video/*,.mkv,.avi,.wmv,.flv,.ts,.m2ts"
+      multiple
+      style="display:none"
+      onchange="handleFiles(this.files)"
+    >
+  </div>
+
+  <!-- LIBRARY TAB -->
+  <div id="tab-library" class="tab-content active">
+    <div class="grid-header">
+      <h2>
+        Mes Films
+        <span class="film-count-label" id="film-count-label"></span>
+      </h2>
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" placeholder="Rechercher..." oninput="filterMovies(this.value)">
+      </div>
+    </div>
+    <div class="movie-grid" id="movieGrid"></div>
+    <div id="emptyState" class="empty">
+      <div class="big-icon">🎞</div>
+      <h3>Votre collection est vide</h3>
+      <p>
+        Ajoutez vos films via l'onglet <strong class="accent">Ajouter</strong><br>
+        Tous les fichiers restent stockés localement dans votre navigateur.
+      </p>
+    </div>
+  </div>
+
+</div>
+
+<!-- PLAYER MODAL -->
+<div class="modal-overlay" id="playerModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 id="modalTitle">Titre du film</h2>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <div class="player-container">
+        <video id="mainPlayer" controls preload="metadata"></video>
+      </div>
+
+      <div class="file-meta">
+        <div class="meta-item">
+          <label>Fichier</label>
+          <span id="meta-name">—</span>
+        </div>
+        <div class="meta-item">
+          <label>Taille</label>
+          <span id="meta-size">—</span>
+        </div>
+        <div class="meta-item">
+          <label>Format</label>
+          <span id="meta-format">—</span>
+        </div>
+      </div>
+
+      <div class="convert-panel">
+        <h3>🔄 Convertir en MP4</h3>
+        <div class="convert-options">
+          <select id="qualitySelect">
+            <option value="high">Haute qualité</option>
+            <option value="medium" selected>Qualité moyenne</option>
+            <option value="low">Faible qualité (plus rapide)</option>
+          </select>
+          <button class="btn btn-blue" id="convertBtn" onclick="convertCurrentMovie()">Convertir en MP4</button>
+          <button class="btn btn-secondary" id="downloadBtn" onclick="downloadCurrentMovie()">⬇ Télécharger</button>
+        </div>
+        <div id="convertProgress" style="display:none">
+          <div class="progress-bar">
+            <div class="progress-fill" id="progressFill"></div>
+          </div>
+          <div class="progress-label">
+            <span id="progressLabel">Traitement...</span>
+            <span id="progressPct">0%</span>
+          </div>
+          <div class="convert-stats" id="convertStats">
+            <div class="stat-box">
+              <span class="stat-icon">⏱</span>
+              <div>
+                <label>Temps écoulé</label>
+                <strong id="stat-elapsed">0:00</strong>
+              </div>
+            </div>
+            <div class="stat-box">
+              <span class="stat-icon">⏳</span>
+              <div>
+                <label>Temps restant</label>
+                <strong id="stat-remaining">—</strong>
+              </div>
+            </div>
+            <div class="stat-box">
+              <span class="stat-icon">⚡</span>
+              <div>
+                <label>Vitesse</label>
+                <strong id="stat-speed">— MB/s</strong>
+              </div>
+            </div>
+            <div class="stat-box">
+              <span class="stat-icon">🎞</span>
+              <div>
+                <label>FPS traitement</label>
+                <strong id="stat-fps">— fps</strong>
+              </div>
+            </div>
+            <div class="stat-box">
+              <span class="stat-icon">📦</span>
+              <div>
+                <label>Taille générée</label>
+                <strong id="stat-written">0 MB</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="convertResult" style="display:none"></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast-container" id="toastContainer"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
