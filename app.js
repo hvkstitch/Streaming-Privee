@@ -139,6 +139,18 @@ const tera = {
     return Array.from(md5js(buffer)).map(b => b.toString(16).padStart(2,'0')).join('');
   },
 
+  /** Réveille le proxy Render (cold start ~30s sur plan gratuit) */
+  async wakeUp() {
+    showSyncBanner('⏳ Réveil du serveur (Render cold start)...');
+    try {
+      const start = Date.now();
+      await fetch(`${CONFIG.proxyUrl}/health`, { signal: AbortSignal.timeout(70000) });
+      const ms = Date.now() - start;
+      if (ms > 3000) showToast(`⚡ Serveur réveillé en ${(ms/1000).toFixed(1)}s`, 'info');
+    } catch {}
+    hideSyncBanner();
+  },
+
   /** Upload complet d'un fichier vers Terabox (multipart) */
   async upload(file, remotePath, onProgress) {
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
@@ -440,6 +452,9 @@ async function addMovie(file) {
   renderGrid(); updateStats();
 
   try {
+    // Réveiller le proxy avant de commencer (cold start Render)
+    await tera.wakeUp();
+
     // S'assurer que le dossier existe
     await tera.ensureDir();
 

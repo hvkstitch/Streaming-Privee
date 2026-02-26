@@ -35,8 +35,8 @@ function teraboxHeaders(ndus, browserId) {
   };
 }
 
-// Fetch avec timeout
-function fetchWithTimeout(url, opts = {}, ms = 25000) {
+// Fetch avec timeout configurable
+function fetchWithTimeout(url, opts = {}, ms = 60000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   return fetch(url, { ...opts, signal: controller.signal })
