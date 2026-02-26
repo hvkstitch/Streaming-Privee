@@ -334,6 +334,26 @@ nav {
   z-index: 3;
 }
 
+/* Offline badge — shown when blob not available */
+.offline-badge {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  background: rgba(224, 82, 82, 0.85);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 0.58rem;
+  letter-spacing: 0.06em;
+  color: #fff;
+  z-index: 3;
+}
+
+/* Pulse animation for loading state */
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; }
+  50%       { opacity: 1; }
+}
+
 .movie-info {
   padding: 12px;
 }

@@ -1,16 +1,81 @@
 /* =====================================================================
    MaCinémathèque — app.js
-   All movies are handled locally in the browser. No server needed.
+   v2: Stockage persistant via IndexedDB (fichiers survivent au refresh)
    ===================================================================== */
+
+// =====================================================================
+// IndexedDB Setup
+// =====================================================================
+
+const DB_NAME    = 'macinema_db';
+const DB_VERSION = 1;
+const STORE_META = 'movies_meta';
+const STORE_BLOB = 'movies_blobs';
+
+let db = null;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    if (db) return resolve(db);
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+
+    req.onupgradeneeded = e => {
+      const d = e.target.result;
+      if (!d.objectStoreNames.contains(STORE_META))
+        d.createObjectStore(STORE_META, { keyPath: 'id' });
+      if (!d.objectStoreNames.contains(STORE_BLOB))
+        d.createObjectStore(STORE_BLOB, { keyPath: 'id' });
+    };
+
+    req.onsuccess = e => { db = e.target.result; resolve(db); };
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+function dbPut(storeName, value) {
+  return openDB().then(d => new Promise((resolve, reject) => {
+    const tx  = d.transaction(storeName, 'readwrite');
+    const req = tx.objectStore(storeName).put(value);
+    req.onsuccess = () => resolve();
+    req.onerror   = e => reject(e.target.error);
+  }));
+}
+
+function dbGet(storeName, key) {
+  return openDB().then(d => new Promise((resolve, reject) => {
+    const tx  = d.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  }));
+}
+
+function dbGetAll(storeName) {
+  return openDB().then(d => new Promise((resolve, reject) => {
+    const tx  = d.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).getAll();
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  }));
+}
+
+function dbDelete(storeName, key) {
+  return openDB().then(d => new Promise((resolve, reject) => {
+    const tx  = d.transaction(storeName, 'readwrite');
+    const req = tx.objectStore(storeName).delete(key);
+    req.onsuccess = () => resolve();
+    req.onerror   = e => reject(e.target.error);
+  }));
+}
 
 // =====================================================================
 // State
 // =====================================================================
 
 /** @type {Array<{id:string, name:string, title:string, size:number, ext:string, added:string}>} */
-let movies = JSON.parse(localStorage.getItem('macinema_index') || '[]');
+let movies = [];
 
-/** In-memory map of movie id → blob URL (lost on page refresh) */
+/** In-memory map of movie id → blob URL (rebuilt from IndexedDB on load) */
 const fileStore = {};
 
 /** Currently open movie in the player */
@@ -32,22 +97,36 @@ const convertStats = {
 // Init
 // =====================================================================
 
-(function init() {
-  restoreMovies();
+(async function init() {
+  showLoadingState();
+  try {
+    await restoreMovies();
+  } catch (e) {
+    console.warn('IndexedDB unavailable, falling back to localStorage', e);
+    movies = JSON.parse(localStorage.getItem('macinema_index') || '[]');
+  }
   renderGrid();
   updateStats();
   setupDropzone();
+  hideLoadingState();
 })();
+
+function showLoadingState() {
+  const empty = document.getElementById('emptyState');
+  if (empty) empty.innerHTML = `
+    <div class="big-icon" style="animation: pulse 1.5s infinite">🎬</div>
+    <h3>Chargement de votre collection...</h3>
+    <p>Restauration des films depuis le stockage local</p>`;
+}
+
+function hideLoadingState() {
+  // renderGrid() will replace the content
+}
 
 // =====================================================================
 // Tab Switching
 // =====================================================================
 
-/**
- * Switch between the Library and Upload tabs.
- * @param {string} name - 'library' | 'upload'
- * @param {HTMLElement} clickedTab - the button that was clicked
- */
 function switchTab(name, clickedTab) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
@@ -55,7 +134,6 @@ function switchTab(name, clickedTab) {
   document.getElementById('tab-' + name).classList.add('active');
 }
 
-/** Programmatically switch to a tab by name (used after adding files). */
 function switchTabDirect(name) {
   const tabs = document.querySelectorAll('.tab');
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
@@ -87,10 +165,6 @@ function setupDropzone() {
 // File Handling
 // =====================================================================
 
-/**
- * Handle a FileList from input or drag-drop.
- * @param {FileList} files
- */
 function handleFiles(files) {
   if (!files.length) return;
   let added = 0;
@@ -105,20 +179,11 @@ function handleFiles(files) {
   if (added > 0) switchTabDirect('library');
 }
 
-/**
- * Check if a filename has a known video extension.
- * @param {string} name
- * @returns {boolean}
- */
 function isVideoExtension(name) {
   return /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mpg|mpeg)$/i.test(name);
 }
 
-/**
- * Add a file to the movie collection.
- * @param {File} file
- */
-function addMovie(file) {
+async function addMovie(file) {
   const id  = 'mv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
   const ext = file.name.split('.').pop().toUpperCase();
 
@@ -131,21 +196,29 @@ function addMovie(file) {
     added: new Date().toLocaleDateString('fr-FR'),
   };
 
-  // Store a temporary Blob URL in memory
+  // Show optimistic UI immediately
   fileStore[id] = URL.createObjectURL(file);
-
   movies.push(movie);
-  saveIndex();
   renderGrid();
   updateStats();
-  showToast('✓ ' + movie.title + ' ajouté à votre collection', 'success');
+  showToast('⏳ Sauvegarde de ' + movie.title + '...', 'info');
+
+  try {
+    // Save metadata to IndexedDB
+    await dbPut(STORE_META, movie);
+
+    // Save the actual file blob to IndexedDB (persists across refreshes!)
+    await dbPut(STORE_BLOB, { id, blob: file });
+
+    showToast('✓ ' + movie.title + ' sauvegardé dans votre collection', 'success');
+  } catch (e) {
+    // Fallback: at least save metadata to localStorage
+    localStorage.setItem('macinema_index', JSON.stringify(movies));
+    showToast('⚠ Film ajouté (stockage limité — utilisez Chrome pour la persistance complète)', 'error');
+    console.warn('IndexedDB save failed:', e);
+  }
 }
 
-/**
- * Clean a filename into a readable title.
- * @param {string} filename
- * @returns {string}
- */
 function cleanTitle(filename) {
   return filename
     .replace(/\.[^.]+$/, '')
@@ -154,34 +227,62 @@ function cleanTitle(filename) {
     .trim();
 }
 
-/** Persist the movie index (metadata only, not blobs) to localStorage. */
+/** Persist metadata fallback to localStorage */
 function saveIndex() {
   localStorage.setItem('macinema_index', JSON.stringify(movies));
 }
 
 /**
- * On page load, blob URLs are gone. Mark movies without blobs as offline.
+ * On page load, restore movies AND their blobs from IndexedDB.
+ * This is the key fix: blobs survive page refresh!
  */
-function restoreMovies() {
-  movies = movies.map(m => ({ ...m, offline: !fileStore[m.id] }));
+async function restoreMovies() {
+  // Load metadata
+  const savedMeta = await dbGetAll(STORE_META);
+  movies = savedMeta || [];
+
+  if (movies.length === 0) {
+    // Migration: check old localStorage data
+    const legacy = JSON.parse(localStorage.getItem('macinema_index') || '[]');
+    if (legacy.length > 0) {
+      movies = legacy;
+      // Migrate metadata to IndexedDB
+      for (const m of movies) {
+        await dbPut(STORE_META, m);
+      }
+      showToast('📦 Collection migrée vers le nouveau stockage persistant', 'info');
+    }
+  }
+
+  // Restore blob URLs from IndexedDB
+  let restoredCount = 0;
+  for (const movie of movies) {
+    try {
+      const record = await dbGet(STORE_BLOB, movie.id);
+      if (record && record.blob) {
+        fileStore[movie.id] = URL.createObjectURL(record.blob);
+        restoredCount++;
+      }
+    } catch (e) {
+      console.warn('Could not restore blob for', movie.id, e);
+    }
+  }
+
+  if (movies.length > 0 && restoredCount > 0) {
+    showToast(`✓ ${restoredCount} film(s) restauré(s) depuis le stockage local`, 'success');
+  }
 }
 
 // =====================================================================
 // Utilities
 // =====================================================================
 
-/**
- * Format bytes into a human-readable string.
- * @param {number} bytes
- * @returns {string}
- */
 function formatSize(bytes) {
   if (bytes < 1024 * 1024)           return (bytes / 1024).toFixed(1) + ' KB';
   if (bytes < 1024 * 1024 * 1024)   return (bytes / 1024 / 1024).toFixed(1) + ' MB';
   return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
 }
 
-/** Update the header stats bar. */
 function updateStats() {
   document.getElementById('stat-count').textContent = movies.length;
   const totalBytes = movies.reduce((sum, m) => sum + (m.size || 0), 0);
@@ -192,10 +293,6 @@ function updateStats() {
 // Render Grid
 // =====================================================================
 
-/**
- * Render the movie grid, optionally filtered by a search string.
- * @param {string} filter
- */
 function renderGrid(filter = '') {
   const grid     = document.getElementById('movieGrid');
   const empty    = document.getElementById('emptyState');
@@ -210,6 +307,13 @@ function renderGrid(filter = '') {
   if (!movies.length) {
     grid.style.display  = 'none';
     empty.style.display = 'block';
+    empty.innerHTML = `
+      <div class="big-icon">🎞</div>
+      <h3>Votre collection est vide</h3>
+      <p>
+        Ajoutez vos films via l'onglet <strong class="accent">Ajouter</strong><br>
+        Les fichiers sont sauvegardés localement et persistent entre les sessions.
+      </p>`;
     return;
   }
 
@@ -227,16 +331,14 @@ function renderGrid(filter = '') {
   });
 }
 
-/**
- * Build the HTML string for a single movie card.
- * @param {{id:string, title:string, name:string, size:number, ext:string, added:string}} m
- * @returns {string}
- */
 function buildMovieCard(m) {
-  const available = !!fileStore[m.id];
+  const available  = !!fileStore[m.id];
   const previewSrc = available ? `src="${fileStore[m.id]}"` : '';
   const thumbIcon  = available ? '🎬' : '📁';
   const thumbOpacity = available ? '0' : '0.3';
+  const offlineBadge = !available
+    ? `<div class="offline-badge" title="Fichier non disponible — ré-importez le film">⚠ Hors ligne</div>`
+    : '';
 
   return `
     <div class="movie-card" data-id="${m.id}">
@@ -245,6 +347,7 @@ function buildMovieCard(m) {
         <div style="position:relative;z-index:1;font-size:2.5rem;opacity:${thumbOpacity}">${thumbIcon}</div>
         <div class="play-overlay" onclick="openPlayer('${m.id}')">▶</div>
         <div class="movie-format">${m.ext}</div>
+        ${offlineBadge}
       </div>
       <div class="movie-info">
         <h3 title="${m.title}">${m.title}</h3>
@@ -261,7 +364,6 @@ function buildMovieCard(m) {
     </div>`;
 }
 
-/** Filter the grid from the search input. */
 function filterMovies(value) {
   renderGrid(value);
 }
@@ -270,10 +372,6 @@ function filterMovies(value) {
 // Player
 // =====================================================================
 
-/**
- * Open the video player modal for a given movie id.
- * @param {string} id
- */
 function openPlayer(id) {
   const movie = movies.find(m => m.id === id);
   if (!movie) return;
@@ -286,24 +384,20 @@ function openPlayer(id) {
 
   currentMovie = { ...movie, url };
 
-  // Fill modal info
   document.getElementById('modalTitle').textContent  = movie.title;
   document.getElementById('meta-name').textContent   = movie.name;
   document.getElementById('meta-size').textContent   = formatSize(movie.size);
   document.getElementById('meta-format').textContent = movie.ext;
 
-  // Load & play
   const player = document.getElementById('mainPlayer');
   player.src = url;
   player.play();
 
-  // Reset convert UI
   resetConvertUI();
 
   document.getElementById('playerModal').classList.add('open');
 }
 
-/** Close the player modal and stop playback. */
 function closeModal() {
   const player = document.getElementById('mainPlayer');
   player.pause();
@@ -312,7 +406,6 @@ function closeModal() {
   currentMovie = null;
 }
 
-// Close modal when clicking the backdrop
 document.getElementById('playerModal').addEventListener('click', function (e) {
   if (e.target === this) closeModal();
 });
@@ -321,17 +414,12 @@ document.getElementById('playerModal').addEventListener('click', function (e) {
 // Download
 // =====================================================================
 
-/** Download the currently open movie. */
 function downloadCurrentMovie() {
   if (!currentMovie) return;
   triggerDownload(currentMovie.url, currentMovie.name);
   showToast('⬇ Téléchargement de ' + currentMovie.name, 'info');
 }
 
-/**
- * Download a movie from the grid by id.
- * @param {string} id
- */
 function downloadById(id) {
   const m   = movies.find(x => x.id === id);
   const url = fileStore[id];
@@ -340,11 +428,6 @@ function downloadById(id) {
   showToast('⬇ Téléchargement de ' + m.name, 'info');
 }
 
-/**
- * Trigger a browser download.
- * @param {string} url
- * @param {string} filename
- */
 function triggerDownload(url, filename) {
   const a    = document.createElement('a');
   a.href     = url;
@@ -356,11 +439,7 @@ function triggerDownload(url, filename) {
 // Delete
 // =====================================================================
 
-/**
- * Delete a movie from the collection.
- * @param {string} id
- */
-function deleteMovie(id) {
+async function deleteMovie(id) {
   const m = movies.find(x => x.id === id);
   if (!m) return;
   if (!confirm(`Supprimer "${m.title}" de votre collection ?`)) return;
@@ -371,7 +450,16 @@ function deleteMovie(id) {
   }
 
   movies = movies.filter(x => x.id !== id);
-  saveIndex();
+
+  // Delete from IndexedDB
+  try {
+    await dbDelete(STORE_META, id);
+    await dbDelete(STORE_BLOB, id);
+  } catch (e) {
+    console.warn('IndexedDB delete failed:', e);
+    saveIndex(); // fallback
+  }
+
   renderGrid();
   updateStats();
   showToast('Film supprimé de la collection', 'info');
@@ -381,7 +469,6 @@ function deleteMovie(id) {
 // Convert to MP4
 // =====================================================================
 
-/** Reset the conversion UI to its initial state. */
 function resetConvertUI() {
   document.getElementById('convertProgress').style.display = 'none';
   document.getElementById('convertResult').style.display   = 'none';
@@ -397,7 +484,6 @@ function resetConvertUI() {
   resetStatsDisplay();
 }
 
-/** Stop the live stats update interval. */
 function stopStatsTimer() {
   if (convertStats.timerInterval) {
     clearInterval(convertStats.timerInterval);
@@ -405,7 +491,6 @@ function stopStatsTimer() {
   }
 }
 
-/** Reset all stats to zero. */
 function resetStatsDisplay() {
   document.getElementById('stat-elapsed').textContent   = '0:00';
   document.getElementById('stat-remaining').textContent = '—';
@@ -415,7 +500,6 @@ function resetStatsDisplay() {
   document.querySelectorAll('.stat-box').forEach(b => b.classList.remove('active'));
 }
 
-/** Start tracking and updating live stats. */
 function startStatsTimer(getDuration, getBytesTotal) {
   convertStats.startTime     = performance.now();
   convertStats.lastByteTime  = performance.now();
@@ -428,7 +512,7 @@ function startStatsTimer(getDuration, getBytesTotal) {
 
   convertStats.timerInterval = setInterval(() => {
     const now      = performance.now();
-    const elapsed  = (now - convertStats.startTime) / 1000; // seconds
+    const elapsed  = (now - convertStats.startTime) / 1000;
     const pct      = parseFloat(document.getElementById('progressFill').style.width) / 100;
     const remaining = pct > 0.01 ? (elapsed / pct) * (1 - pct) : null;
 
@@ -444,10 +528,6 @@ function startStatsTimer(getDuration, getBytesTotal) {
   }, 500);
 }
 
-/**
- * Update frame rate stat — call this from the draw loop.
- * @param {number} now - performance.now() timestamp
- */
 function tickFrame(now) {
   convertStats.frameCount++;
   const elapsed = (now - convertStats.startTime) / 1000;
@@ -457,10 +537,6 @@ function tickFrame(now) {
   }
 }
 
-/**
- * Update bytes-written stat (called each time MediaRecorder fires ondataavailable).
- * @param {number} bytes
- */
 function tickBytes(bytes) {
   const now = performance.now();
   convertStats.bytesWritten += bytes;
@@ -477,18 +553,12 @@ function tickBytes(bytes) {
   }
 }
 
-/**
- * Format seconds into M:SS string.
- * @param {number} seconds
- * @returns {string}
- */
 function formatDuration(seconds) {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-/** Convert the currently open movie to MP4 using MediaRecorder. */
 async function convertCurrentMovie() {
   if (!currentMovie) return;
 
@@ -508,11 +578,9 @@ async function convertCurrentMovie() {
   }
 }
 
-/** Core conversion logic using canvas + MediaRecorder. */
 async function runConversion() {
   const btn = document.getElementById('convertBtn');
 
-  // Create an off-screen video element
   const video = document.createElement('video');
   video.src   = currentMovie.url;
 
@@ -523,7 +591,6 @@ async function runConversion() {
 
   const duration = video.duration;
 
-  // Find a supported MIME type (prefer MP4, fall back to WebM)
   const candidates = [
     'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
     'video/mp4',
@@ -534,24 +601,20 @@ async function runConversion() {
   const mimeType = candidates.find(m => MediaRecorder.isTypeSupported(m));
   if (!mimeType) throw new Error('Votre navigateur ne supporte pas l\'enregistrement vidéo');
 
-  // Canvas for video frames
   const canvas  = document.createElement('canvas');
   const ctx     = canvas.getContext('2d');
   canvas.width  = video.videoWidth  || 1280;
   canvas.height = video.videoHeight || 720;
 
-  // Audio routing
   const audioCtx = new AudioContext();
   const src      = audioCtx.createMediaElementSource(video);
   const dest     = audioCtx.createMediaStreamDestination();
   src.connect(dest);
   src.connect(audioCtx.destination);
 
-  // Combine video & audio streams
   const videoStream = canvas.captureStream(30);
   const combined    = new MediaStream([...videoStream.getTracks(), ...dest.stream.getTracks()]);
 
-  // Bitrate based on quality selection
   const quality  = document.getElementById('qualitySelect').value;
   const bitrates = { high: 8_000_000, medium: 4_000_000, low: 1_500_000 };
   const bitrate  = bitrates[quality] || bitrates.medium;
@@ -559,19 +622,16 @@ async function runConversion() {
   const recorder = new MediaRecorder(combined, { mimeType, videoBitsPerSecond: bitrate });
   const chunks   = [];
 
-  // ---- Wire stats ----
   recorder.ondataavailable = e => {
     if (e.data.size) {
       chunks.push(e.data);
       tickBytes(e.data.size);
     }
   };
-  recorder.start(500); // fire every 500ms for smoother speed readings
+  recorder.start(500);
 
-  // Start the stats overlay
   startStatsTimer(duration);
 
-  // Play and draw frames to canvas
   video.currentTime = 0;
   video.play();
 
@@ -585,7 +645,6 @@ async function runConversion() {
 
   video.onplay = drawLoop;
 
-  // Wait for the video to finish (with a safety timeout)
   await Promise.race([
     new Promise(res => { video.onended = res; }),
     new Promise(res => setTimeout(res, (duration + 5) * 1000)),
@@ -596,7 +655,6 @@ async function runConversion() {
   audioCtx.close();
   stopStatsTimer();
 
-  // Build result blob
   const ext     = mimeType.includes('mp4') ? 'mp4' : 'webm';
   const blob    = new Blob(chunks, { type: mimeType });
   const blobUrl = URL.createObjectURL(blob);
@@ -604,7 +662,6 @@ async function runConversion() {
 
   setProgress(100, 'Conversion terminée !');
 
-  // Final stats snapshot
   const totalElapsed = (performance.now() - convertStats.startTime) / 1000;
   document.getElementById('stat-elapsed').textContent   = formatDuration(totalElapsed);
   document.getElementById('stat-remaining').textContent = '0:00';
@@ -616,33 +673,17 @@ async function runConversion() {
   btn.disabled    = false;
 }
 
-/**
- * Update the progress bar during conversion.
- * @param {number} currentTime
- * @param {number} duration
- */
 function updateConvertProgress(currentTime, duration) {
   const pct = Math.min(99, Math.round((currentTime / duration) * 100));
   setProgress(pct, `Conversion : ${currentTime.toFixed(0)}s / ${duration.toFixed(0)}s`);
 }
 
-/**
- * Set the progress bar value and label.
- * @param {number} pct - 0 to 100
- * @param {string} label
- */
 function setProgress(pct, label) {
   document.getElementById('progressFill').style.width  = pct + '%';
   document.getElementById('progressPct').textContent   = pct + '%';
   document.getElementById('progressLabel').textContent = label;
 }
 
-/**
- * Show the success message after conversion.
- * @param {string} url
- * @param {string} name
- * @param {number} size
- */
 function showConvertSuccess(url, name, size) {
   const div  = document.getElementById('convertResult');
   div.style.display = 'block';
@@ -655,10 +696,6 @@ function showConvertSuccess(url, name, size) {
     </div>`;
 }
 
-/**
- * Handle a conversion failure.
- * @param {Error} err
- */
 function handleConversionError(err) {
   stopStatsTimer();
   showToast('Erreur de conversion : ' + err.message, 'error');
@@ -682,13 +719,7 @@ function handleConversionError(err) {
     </div>`;
 }
 
-/**
- * Add a converted file to the collection.
- * @param {string} url - Blob URL
- * @param {string} name
- * @param {number} size
- */
-function addConverted(url, name, size) {
+async function addConverted(url, name, size) {
   const id  = 'mv_conv_' + Date.now();
   const ext = name.split('.').pop().toUpperCase();
 
@@ -701,23 +732,35 @@ function addConverted(url, name, size) {
     added: new Date().toLocaleDateString('fr-FR'),
   };
 
-  fileStore[id] = url;
-  movies.push(movie);
-  saveIndex();
-  renderGrid();
-  updateStats();
-  showToast('✓ Film converti ajouté à la collection', 'success');
+  // Fetch the blob from the URL to persist it
+  try {
+    const response = await fetch(url);
+    const blob     = await response.blob();
+
+    fileStore[id] = url;
+    movies.push(movie);
+
+    await dbPut(STORE_META, movie);
+    await dbPut(STORE_BLOB, { id, blob });
+
+    renderGrid();
+    updateStats();
+    showToast('✓ Film converti sauvegardé dans la collection', 'success');
+  } catch (e) {
+    // Fallback without persistence
+    fileStore[id] = url;
+    movies.push(movie);
+    saveIndex();
+    renderGrid();
+    updateStats();
+    showToast('✓ Film converti ajouté (non persistant)', 'info');
+  }
 }
 
 // =====================================================================
 // Toast Notifications
 // =====================================================================
 
-/**
- * Display a toast notification.
- * @param {string} message
- * @param {'info'|'success'|'error'} type
- */
 function showToast(message, type = 'info') {
   const icons = { success: '✅', error: '❌', info: 'ℹ️' };
   const container = document.getElementById('toastContainer');
