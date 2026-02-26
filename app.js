@@ -547,8 +547,76 @@ async function deleteMovie(id) {
 }
 
 // =====================================================================
-// Convert to MP4
+// Convert to MP4 — FFmpeg.wasm (AVI, MKV, MOV, WMV, etc.)
 // =====================================================================
+
+let ffmpegInstance = null;
+
+/** Charge FFmpeg.wasm depuis CDN (une seule fois) */
+async function loadFFmpeg() {
+  if (ffmpegInstance) return ffmpegInstance;
+
+  setProgress(0, 'Chargement de FFmpeg...');
+  showToast('⏳ Chargement de FFmpeg (~30 MB, une seule fois)...', 'info');
+
+  const { FFmpeg }    = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js');
+  const { toBlobURL } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/esm/index.js');
+
+  const ff = new FFmpeg();
+
+  // Progression globale 0→1 fournie par FFmpeg.wasm
+  ff.on('progress', ({ progress }) => {
+    const pct     = Math.min(99, Math.round(progress * 100));
+    const elapsed = (performance.now() - convertStats.startTime) / 1000;
+    setProgress(pct, `Conversion : ${pct}%`);
+    document.getElementById('stat-elapsed').textContent = formatDuration(elapsed);
+    if (pct > 1) {
+      const remaining = (elapsed / pct) * (100 - pct);
+      document.getElementById('stat-remaining').textContent = formatDuration(remaining);
+    }
+  });
+
+  // Logs FFmpeg ligne par ligne :
+  // frame=  240 fps= 48 q=23.0 size=    3072kB time=00:00:10.01 bitrate=2514.5kbits/s speed=2.01x
+  ff.on('log', ({ message }) => {
+    // FPS d'encodage
+    const fpsM = message.match(/fps=\s*([\d.]+)/);
+    if (fpsM && parseFloat(fpsM[1]) > 0)
+      document.getElementById('stat-fps').textContent = parseFloat(fpsM[1]).toFixed(0) + ' fps';
+
+    // Taille générée (kB → bytes)
+    const sizeM = message.match(/size=\s*([\d.]+)\s*[kK][bB]/);
+    if (sizeM) {
+      const bytes = parseFloat(sizeM[1]) * 1024;
+      const now   = performance.now();
+      const dt    = (now - convertStats.lastByteTime) / 1000;
+
+      // MB/s = delta taille / delta temps
+      if (dt >= 0.3 && bytes > convertStats.lastBytes) {
+        const mbps = (bytes - convertStats.lastBytes) / dt / 1048576;
+        document.getElementById('stat-speed').textContent = mbps.toFixed(2) + ' MB/s';
+        convertStats.lastBytes    = bytes;
+        convertStats.lastByteTime = now;
+      } else if (convertStats.lastBytes === 0) {
+        convertStats.lastBytes    = bytes;
+        convertStats.lastByteTime = now;
+      }
+
+      convertStats.bytesWritten = bytes;
+      document.getElementById('stat-written').textContent = formatSize(bytes);
+    }
+  });
+
+  // Charger les wasm core depuis CDN
+  const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
+  await ff.load({
+    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`,   'text/javascript'),
+    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+  });
+
+  ffmpegInstance = { ff };
+  return ffmpegInstance;
+}
 
 function resetConvertUI() {
   document.getElementById('convertProgress').style.display = 'none';
@@ -583,32 +651,12 @@ function startStatsTimer() {
   convertStats.bytesWritten = 0;
   convertStats.frameCount   = 0;
   document.querySelectorAll('.stat-box').forEach(b => b.classList.add('active'));
+  // Le timer met juste à jour le temps écoulé chaque seconde
+  // Les autres stats (MB/s, taille, fps) sont mises à jour en temps réel par les logs FFmpeg
   convertStats.timerInterval = setInterval(() => {
-    const elapsed   = (performance.now() - convertStats.startTime) / 1000;
-    const pct       = parseFloat(document.getElementById('progressFill').style.width) / 100;
-    const remaining = pct > 0.01 ? (elapsed / pct) * (1 - pct) : null;
-    document.getElementById('stat-elapsed').textContent   = formatDuration(elapsed);
-    document.getElementById('stat-remaining').textContent = remaining !== null ? formatDuration(remaining) : '—';
-    document.getElementById('stat-written').textContent   = formatSize(convertStats.bytesWritten);
-  }, 500);
-}
-
-function tickFrame(now) {
-  convertStats.frameCount++;
-  const elapsed = (now - convertStats.startTime) / 1000;
-  if (elapsed > 0) document.getElementById('stat-fps').textContent = Math.round(convertStats.frameCount / elapsed) + ' fps';
-}
-
-function tickBytes(bytes) {
-  const now = performance.now();
-  convertStats.bytesWritten += bytes;
-  const dt = (now - convertStats.lastByteTime) / 1000;
-  if (dt >= 0.5) {
-    const delta = convertStats.bytesWritten - convertStats.lastBytes;
-    convertStats.lastBytes    = convertStats.bytesWritten;
-    convertStats.lastByteTime = now;
-    document.getElementById('stat-speed').textContent = (delta / dt / 1048576).toFixed(2) + ' MB/s';
-  }
+    const elapsed = (performance.now() - convertStats.startTime) / 1000;
+    document.getElementById('stat-elapsed').textContent = formatDuration(elapsed);
+  }, 1000);
 }
 
 function formatDuration(s) {
@@ -618,75 +666,93 @@ function formatDuration(s) {
 async function convertCurrentMovie() {
   if (!currentMovie) return;
   const btn = document.getElementById('convertBtn');
-  btn.disabled = true; btn.textContent = 'Conversion...';
+  btn.disabled = true; btn.textContent = 'Chargement FFmpeg...';
   document.getElementById('convertProgress').style.display = 'block';
   document.getElementById('convertResult').style.display   = 'none';
-  showToast('⚙ Conversion en MP4...', 'info');
-  try { await runConversion(); } catch (err) { handleConversionError(err); }
+
+  try {
+    await runFFmpegConversion();
+  } catch (err) {
+    handleConversionError(err);
+  }
 }
 
-async function runConversion() {
-  const btn   = document.getElementById('convertBtn');
-  const video = document.createElement('video');
-  video.src = currentMovie.url;
-  video.crossOrigin = 'anonymous';
-  await new Promise((res, rej) => { video.onloadedmetadata = res; video.onerror = rej; });
+async function runFFmpegConversion() {
+  const btn = document.getElementById('convertBtn');
+  btn.textContent = 'Conversion...';
 
-  const duration = video.duration;
-  const mimeType = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm']
-    .find(m => MediaRecorder.isTypeSupported(m));
-  if (!mimeType) throw new Error('Votre navigateur ne supporte pas l\'enregistrement vidéo');
+  // Qualité → CRF FFmpeg (plus bas = meilleure qualité)
+  const crf = { high: '18', medium: '23', low: '28' };
+  const quality = document.getElementById('qualitySelect').value;
 
-  const canvas = document.createElement('canvas');
-  const ctx    = canvas.getContext('2d');
-  canvas.width  = video.videoWidth  || 1280;
-  canvas.height = video.videoHeight || 720;
+  // Charger FFmpeg
+  const { ff, fetchFile } = await loadFFmpeg();
 
-  const audioCtx = new AudioContext();
-  const src      = audioCtx.createMediaElementSource(video);
-  const dest     = audioCtx.createMediaStreamDestination();
-  src.connect(dest);
-  src.connect(audioCtx.destination);
-
-  const combined = new MediaStream([...canvas.captureStream(30).getTracks(), ...dest.stream.getTracks()]);
-  const bitrates = { high: 8_000_000, medium: 4_000_000, low: 1_500_000 };
-  const recorder = new MediaRecorder(combined, { mimeType, videoBitsPerSecond: bitrates[document.getElementById('qualitySelect').value] || 4_000_000 });
-  const chunks   = [];
-
-  recorder.ondataavailable = e => { if (e.data.size) { chunks.push(e.data); tickBytes(e.data.size); } };
-  recorder.start(500);
   startStatsTimer();
-  video.currentTime = 0;
-  video.play();
+  setProgress(1, 'Lecture du fichier source...');
 
-  const drawLoop = () => {
-    if (video.paused || video.ended) return;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    setProgress(Math.min(99, Math.round((video.currentTime / duration) * 100)), `Conversion : ${video.currentTime.toFixed(0)}s / ${duration.toFixed(0)}s`);
-    tickFrame(performance.now());
-    requestAnimationFrame(drawLoop);
-  };
-  video.onplay = drawLoop;
+  // Récupérer le blob source
+  let sourceData;
+  const url = currentMovie.url;
+  if (url.startsWith('blob:')) {
+    const cached = await idbGet(currentMovie.id);
+    if (cached && cached.blob) {
+      sourceData = await cached.blob.arrayBuffer();
+    } else {
+      const res  = await fetch(url);
+      sourceData = await res.arrayBuffer();
+    }
+  } else {
+    // URL Supabase — fetch direct
+    showToast('⬇ Téléchargement depuis Supabase...', 'info');
+    const res  = await fetch(url);
+    sourceData = await res.arrayBuffer();
+  }
 
-  await Promise.race([
-    new Promise(res => { video.onended = res; }),
-    new Promise(res => setTimeout(res, (duration + 5) * 1000)),
+  const ext    = currentMovie.ext.toLowerCase();
+  const inFile = `input.${ext}`;
+  const outFile = 'output.mp4';
+
+  setProgress(3, 'Écriture dans FFmpeg...');
+  await ff.writeFile(inFile, new Uint8Array(sourceData));
+
+  setProgress(5, 'Conversion en cours...');
+  btn.textContent = 'Conversion...';
+
+  // Commande FFmpeg : re-encode en H.264 / AAC, compatible partout
+  await ff.exec([
+    '-i', inFile,
+    '-c:v', 'libx264',
+    '-crf', crf[quality] || '23',
+    '-preset', 'fast',
+    '-c:a', 'aac',
+    '-b:a', '192k',
+    '-movflags', '+faststart',
+    '-y',
+    outFile,
   ]);
 
-  recorder.stop();
-  await new Promise(res => { recorder.onstop = res; });
-  audioCtx.close();
-  stopStatsTimer();
+  setProgress(98, 'Finalisation...');
 
-  const ext     = mimeType.includes('mp4') ? 'mp4' : 'webm';
-  const blob    = new Blob(chunks, { type: mimeType });
+  // Lire le résultat
+  const data    = await ff.readFile(outFile);
+  const blob    = new Blob([data.buffer], { type: 'video/mp4' });
   const blobUrl = URL.createObjectURL(blob);
-  const outName = currentMovie.title + '_converti.' + ext;
+  const outName = currentMovie.title + '_converti.mp4';
 
+  // Nettoyage mémoire FFmpeg
+  try { await ff.deleteFile(inFile);  } catch {}
+  try { await ff.deleteFile(outFile); } catch {}
+
+  stopStatsTimer();
   setProgress(100, 'Conversion terminée !');
-  document.getElementById('stat-elapsed').textContent   = formatDuration((performance.now() - convertStats.startTime) / 1000);
+
+  const totalElapsed = (performance.now() - convertStats.startTime) / 1000;
+  document.getElementById('stat-elapsed').textContent   = formatDuration(totalElapsed);
   document.getElementById('stat-remaining').textContent = '0:00';
-  document.getElementById('stat-written').textContent   = formatSize(blob.size);
+  document.getElementById('stat-written').textContent   = formatSize(blob.size);  // taille réelle finale
+  document.getElementById('stat-speed').textContent     = '—';
+  document.getElementById('stat-fps').textContent       = '—';
 
   window._lastConvertedBlob = blob;
   showConvertSuccess(blobUrl, outName, blob.size);
@@ -715,6 +781,7 @@ function showConvertSuccess(url, name, size) {
 
 function handleConversionError(err) {
   stopStatsTimer();
+  console.error('[FFmpeg]', err);
   showToast('Erreur : ' + err.message, 'error');
   const btn = document.getElementById('convertBtn');
   btn.textContent = 'Convertir en MP4'; btn.disabled = false;
@@ -722,9 +789,9 @@ function handleConversionError(err) {
   div.style.display = 'block';
   div.innerHTML = `
     <div class="result-warning">
-      ⚠ Conversion non supportée par votre navigateur.<br>
-      <strong style="color:var(--accent)">Solution :</strong>
-      Utilisez <a href="https://www.handbrake.fr" target="_blank">HandBrake</a> (gratuit).<br><br>
+      ⚠ Erreur de conversion : <em>${err.message}</em><br><br>
+      Si le problème persiste, téléchargez le fichier et utilisez
+      <a href="https://www.handbrake.fr" target="_blank">HandBrake</a> (gratuit).<br><br>
       <button class="btn btn-secondary" onclick="downloadCurrentMovie()" style="width:auto">⬇ Télécharger l'original</button>
     </div>`;
 }

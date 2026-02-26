@@ -30,7 +30,7 @@
       <h2>Déposer vos films ici</h2>
       <p>
         Glissez-déposez vos fichiers vidéo ou cliquez pour sélectionner<br>
-        Tous vos films restent stockés localement sur votre appareil
+        Tous vos films sont synchronisés sur Supabase
       </p>
       <div class="formats">
         <span class="badge">MP4</span>
@@ -73,7 +73,7 @@
       <h3>Votre collection est vide</h3>
       <p>
         Ajoutez vos films via l'onglet <strong class="accent">Ajouter</strong><br>
-        Tous les fichiers restent stockés localement dans votre navigateur.
+        Ils seront synchronisés automatiquement sur tous vos appareils.
       </p>
     </div>
   </div>
@@ -109,12 +109,12 @@
       </div>
 
       <div class="convert-panel">
-        <h3>🔄 Convertir en MP4</h3>
+        <h3>🔄 Convertir en MP4 — FFmpeg</h3>
         <div class="convert-options">
           <select id="qualitySelect">
-            <option value="high">Haute qualité</option>
-            <option value="medium" selected>Qualité moyenne</option>
-            <option value="low">Faible qualité (plus rapide)</option>
+            <option value="high">Haute qualité (CRF 18)</option>
+            <option value="medium" selected>Qualité moyenne (CRF 23)</option>
+            <option value="low">Légère (CRF 28, plus rapide)</option>
           </select>
           <button class="btn btn-blue" id="convertBtn" onclick="convertCurrentMovie()">Convertir en MP4</button>
           <button class="btn btn-secondary" id="downloadBtn" onclick="downloadCurrentMovie()">⬇ Télécharger</button>
@@ -146,13 +146,13 @@
               <span class="stat-icon">⚡</span>
               <div>
                 <label>Vitesse</label>
-                <strong id="stat-speed">— MB/s</strong>
+                <strong id="stat-speed">— x</strong>
               </div>
             </div>
             <div class="stat-box">
               <span class="stat-icon">🎞</span>
               <div>
-                <label>FPS traitement</label>
+                <label>FPS encodage</label>
                 <strong id="stat-fps">— fps</strong>
               </div>
             </div>
@@ -175,6 +175,12 @@
 <!-- TOAST -->
 <div class="toast-container" id="toastContainer"></div>
 
-<script src="app.js"></script>
+<script>
+  // Enregistrement du Service Worker (requis pour FFmpeg.wasm / SharedArrayBuffer)
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(console.warn);
+  }
+</script>
+<script src="app.js" type="module"></script>
 </body>
 </html>
