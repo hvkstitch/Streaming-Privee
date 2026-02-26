@@ -123,7 +123,11 @@ const tera = {
       blockList.push(md5);
 
       // Encoder le chunk en base64 pour l'envoyer au proxy
-      const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+      // ⚠ Ne pas utiliser spread (...) sur un grand Uint8Array → stack overflow
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let j = 0; j < bytes.length; j++) binary += String.fromCharCode(bytes[j]);
+      const base64 = btoa(binary);
 
       const pct = Math.round(((i + 1) / totalChunks) * 85);
       onProgress(pct, `Upload ${i + 1}/${totalChunks} (${Math.round(end / 1024 / 1024)} MB)...`);
