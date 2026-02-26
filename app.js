@@ -157,19 +157,22 @@ const tera = {
   async upload(file, remotePath, onProgress) {
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     const blockList   = [];
+    const startTime   = Date.now();
 
     // Étape 1 : précréer
-    onProgress(0, 'Précréation Terabox...');
+    onProgress(0, `Précréation Terabox (${totalChunks} chunks)...`);
+    updateDiag('terabox', 'pending', `⏳ Précréation (${formatSize(file.size)}, ${totalChunks} chunks)...`);
+
     const pre = await this.post('precreate', {
       path:      remotePath,
       size:      file.size,
-      blockList: ['5910a591dd8fc18c32a8f3df4ad24ea8'], // MD5 fictif pour précréation
+      blockList: ['5910a591dd8fc18c32a8f3df4ad24ea8'],
     });
 
-    if (pre.errno && pre.errno !== 0) throw new Error('Precreate échoué : ' + JSON.stringify(pre));
+    if (pre.errno && pre.errno !== 0) throw new Error('Precreate échoué errno=' + pre.errno + ' : ' + JSON.stringify(pre));
     const uploadId = pre.uploadid;
 
-    // Étape 2 : upload des chunks
+    // Étape 2 : upload des chunks avec retry
     for (let i = 0; i < totalChunks; i++) {
       const start  = i * CHUNK_SIZE;
       const end    = Math.min(start + CHUNK_SIZE, file.size);
@@ -178,8 +181,7 @@ const tera = {
       const md5    = await this.md5(buffer);
       blockList.push(md5);
 
-      // Encoder le chunk en base64 — traitement par sous-blocs de 8 KB
-      // (évite le stack overflow du spread ET le freeze O(n²) de la boucle +=)
+      // Encoder en base64 par sous-blocs de 8 KB (évite stack overflow)
       const bytes = new Uint8Array(buffer);
       let binary = '';
       const BTOA_CHUNK = 8192;
@@ -188,36 +190,51 @@ const tera = {
       }
       const base64 = btoa(binary);
 
-      const pct = Math.round(((i + 1) / totalChunks) * 85);
-      onProgress(pct, `Upload ${i + 1}/${totalChunks} (${Math.round(end / 1024 / 1024)} MB)...`);
+      // Calcul vitesse
+      const elapsed  = (Date.now() - startTime) / 1000;
+      const uploaded  = start;
+      const speed     = elapsed > 1 ? uploaded / elapsed : 0;
+      const remaining = speed > 0 ? (file.size - uploaded) / speed : 0;
+      const speedStr  = speed > 0 ? formatSize(speed) + '/s' : '...';
+      const pct       = Math.round(((i + 0.5) / totalChunks) * 90);
 
-      const up = await this.post('upload', {
-        path:        remotePath,
-        uploadId,
-        partseq:     i,
-        chunkBase64: base64,
-        md5,
-      });
+      const label = `Chunk ${i + 1}/${totalChunks} — ${speedStr} — reste ~${formatDuration(remaining)}`;
+      onProgress(pct, label);
+      updateDiag('terabox', 'pending', `⬆ ${i + 1}/${totalChunks} chunks — ${speedStr}`);
 
-      if (up.error_code) throw new Error('Upload chunk échoué : ' + JSON.stringify(up));
+      // Upload avec retry (3 tentatives)
+      let lastErr;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const up = await this.post('upload', {
+            path: remotePath, uploadId, partseq: i, chunkBase64: base64, md5,
+          });
+          if (up.error_code && up.error_code !== 0) throw new Error('error_code=' + up.error_code);
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          updateDiag('terabox', 'pending', `⚠ Chunk ${i + 1} tentative ${attempt}/3 — ${e.message.slice(0, 60)}`);
+          if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
+        }
+      }
+      if (lastErr) throw new Error(`Chunk ${i + 1}/${totalChunks} échoué après 3 tentatives : ${lastErr.message}`);
     }
 
     // Étape 3 : finaliser
-    onProgress(90, 'Finalisation...');
-    const create = await this.post('create', {
-      path:      remotePath,
-      size:      file.size,
-      uploadId,
-      blockList,
-    });
-
-    if (create.errno && create.errno !== 0) throw new Error('Create échoué : ' + JSON.stringify(create));
+    onProgress(95, 'Finalisation Terabox...');
+    updateDiag('terabox', 'pending', '⏳ Finalisation...');
+    const create = await this.post('create', { path: remotePath, size: file.size, uploadId, blockList });
+    if (create.errno && create.errno !== 0) throw new Error('Create échoué errno=' + create.errno + ' : ' + JSON.stringify(create));
 
     onProgress(100, 'Upload terminé !');
     return { fsId: create.fs_id || create.fsid, path: remotePath };
   },
 
-  /** Obtenir le lien de téléchargement direct depuis fsId */
+  /** Créer le dossier si besoin */
+  async ensureDir() {
+    try { await this.post('mkdir', { path: CONFIG.remoteDir }); } catch {}
+  },
   async getDlink(fsId) {
     const data = await this.get('dlink', { fsId });
     if (!data.dlink) throw new Error('Pas de dlink');
@@ -229,9 +246,30 @@ const tera = {
     return this.post('delete', { filelist: [path] });
   },
 
-  /** Créer le dossier si besoin */
-  async ensureDir() {
-    try { await this.post('mkdir', { path: CONFIG.remoteDir }); } catch {}
+  /** Réveille le proxy Render (cold start ~15s) et teste la connexion */
+  async wakeUp() {
+    updateDiag('proxy', 'pending', '⏳ Connexion au proxy...');
+    try {
+      const r = await fetch(`${CONFIG.proxyUrl}/health`, { signal: AbortSignal.timeout(20000) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      updateDiag('proxy', 'ok', '✅ Proxy connecté');
+    } catch (e) {
+      updateDiag('proxy', 'error', '❌ Proxy injoignable : ' + e.message);
+      throw new Error('Proxy injoignable — vérifie que ton service Render est démarré. (' + e.message + ')');
+    }
+  },
+
+  /** Teste l'auth Terabox */
+  async testTerabox() {
+    updateDiag('terabox', 'pending', '⏳ Test Terabox...');
+    try {
+      const data = await this.get('list', { dir: '/' });
+      if (data.errno && data.errno !== 0) throw new Error('errno=' + data.errno + ' — token expiré ?');
+      updateDiag('terabox', 'ok', '✅ Terabox authentifié');
+    } catch (e) {
+      updateDiag('terabox', 'error', '❌ Terabox : ' + e.message);
+      throw new Error('Authentification Terabox échouée — vérifie ndus et jsToken. (' + e.message + ')');
+    }
   },
 };
 
@@ -341,6 +379,46 @@ const convertStats = {
 })();
 
 // =====================================================================
+// Panneau de diagnostic de connexion
+// =====================================================================
+
+function showDiagPanel() {
+  if (document.getElementById('diagPanel')) return;
+  const panel = document.createElement('div');
+  panel.id = 'diagPanel';
+  panel.style.cssText = `
+    position:fixed;bottom:16px;right:16px;z-index:9999;
+    background:#0f1219;border:1px solid #1e2535;border-radius:10px;
+    padding:14px 18px;font-size:0.75rem;color:#aab;
+    box-shadow:0 4px 24px rgba(0,0,0,0.6);min-width:240px;
+  `;
+  panel.innerHTML = `
+    <div style="font-weight:700;color:#e2e8f0;margin-bottom:10px;font-size:0.8rem">🔌 Diagnostic connexion</div>
+    <div id="diag-proxy"   style="margin:4px 0">⏳ Proxy...</div>
+    <div id="diag-terabox" style="margin:4px 0">⏳ Terabox...</div>
+    <button onclick="document.getElementById('diagPanel').remove()" 
+      style="margin-top:10px;background:none;border:1px solid #2d3748;color:#6b7385;
+             padding:3px 10px;border-radius:4px;cursor:pointer;font-size:0.7rem;width:100%">Fermer</button>
+  `;
+  document.body.appendChild(panel);
+}
+
+function updateDiag(key, status, msg) {
+  const el = document.getElementById('diag-' + key);
+  if (!el) return;
+  const colors = { pending: '#e8b86d', ok: '#48bb78', error: '#fc8181' };
+  el.style.color = colors[status] || '#aab';
+  el.textContent = msg;
+}
+
+function hideDiagPanel(delay = 3000) {
+  setTimeout(() => {
+    const p = document.getElementById('diagPanel');
+    if (p) { p.style.transition = 'opacity 0.5s'; p.style.opacity = '0'; setTimeout(() => p?.remove(), 500); }
+  }, delay);
+}
+
+// =====================================================================
 // Config Warning
 // =====================================================================
 
@@ -441,6 +519,7 @@ async function addMovie(file) {
   const id         = 'mv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
   const ext        = file.name.split('.').pop().toUpperCase();
   const remotePath = `${CONFIG.remoteDir}/${id}_${file.name}`;
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
   const movie = {
     id, name: file.name, title: cleanTitle(file.name),
@@ -453,21 +532,30 @@ async function addMovie(file) {
   movies.unshift(movie);
   renderGrid(); updateStats();
 
+  // Afficher le panneau de diagnostic
+  showDiagPanel();
+
   try {
-    // Réveiller le proxy avant de commencer (cold start Render)
+    // Étape 1 : réveil + test proxy
     await tera.wakeUp();
 
-    // S'assurer que le dossier existe
+    // Étape 2 : test Terabox
+    await tera.testTerabox();
+
+    // Étape 3 : dossier distant
     await tera.ensureDir();
 
-    // Upload vers Terabox avec progression
+    // Étape 4 : upload avec progression chunk par chunk
     const { fsId } = await tera.upload(file, remotePath, (pct, label) => {
       const card = document.querySelector(`[data-id="${id}"]`);
       if (card) updateCardProgress(card, pct, label);
     });
 
-    movie.fs_id    = fsId;
+    movie.fs_id     = fsId;
     movie.uploading = false;
+
+    updateDiag('terabox', 'ok', `✅ Upload terminé (${totalChunks} chunk${totalChunks > 1 ? 's' : ''})`);
+    hideDiagPanel(2000);
 
     // Sauvegarder en Supabase
     await supa.insert({
@@ -488,6 +576,7 @@ async function addMovie(file) {
     movie.terabox_path = null;
     renderGrid();
     showToast('⚠ Upload échoué : ' + e.message, 'error');
+    // Laisser le panneau visible pour voir l'erreur
   }
 }
 
