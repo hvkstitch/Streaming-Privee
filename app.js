@@ -13,7 +13,7 @@
 const CONFIG = {
   // URL de ton proxy Render (après déploiement)
   // ex: 'https://macinema-proxy.onrender.com'
-  proxyUrl: 'https://TON-PROXY.onrender.com',
+  proxyUrl: 'https://proxy-tera-box-streaming-privee.onrender.com',
 
   // Terabox credentials (à renouveler tous les ~30 jours)
   // Guide : voir README ou section "Comment obtenir" plus bas
