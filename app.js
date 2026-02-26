@@ -21,8 +21,10 @@ const CONFIG = {
   supabaseAnon: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9saGZkdXFueGhhb2F4Y3hqeHhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIxMDI3NTgsImV4cCI6MjA4NzY3ODc1OH0.gJokdFbBt5k9DuHBkMRtxhHcNQNJlyOjXnXMNu-Q-1k',
 };
 
-// Taille de chaque chunk d'upload : 500 MB (pas de limite pratique)
-const CHUNK_SIZE = 500 * 1024 * 1024;
+// Taille de chaque chunk d'upload : 10 MB
+// (le chunk est encodé en base64 → x1.33, soit ~13 MB de JSON au proxy)
+// Render free tier coupe à 30s → 10 MB est le bon compromis vitesse/fiabilité
+const CHUNK_SIZE = 10 * 1024 * 1024;
 
 // =====================================================================
 // Supabase helpers
