@@ -1,37 +1,33 @@
 /**
- * MaCinémathèque — Terabox Proxy
- * Hébergé gratuitement sur Render.com
- * Relaie les requêtes du navigateur vers l'API Terabox (contourne CORS)
+ * MaCinémathèque — Terabox Proxy v2
+ * Le navigateur envoie le fichier en UNE seule requête binaire (FormData)
+ * Le serveur gère tout le découpage en chunks vers Terabox
  */
 
 const express = require('express');
 const fetch   = require('node-fetch');
+const multer  = require('multer');
+const crypto  = require('crypto');
 const app     = express();
 
-// Ne pas pré-parser le body pour /terabox/upload — il a son propre parser avec grande limite
-app.use((req, res, next) => {
-  if (req.path === '/terabox/upload') return next();
-  express.json()(req, res, next);
-});
-app.use((req, res, next) => {
-  if (req.path === '/terabox/upload') return next();
-  express.urlencoded({ extended: true })(req, res, next);
-});
+const upload   = multer({ storage: multer.memoryStorage() });
+const CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB par chunk côté serveur→Terabox
 
-// CORS + CORP — nécessaire car la page tourne avec COEP:require-corp (Service Worker FFmpeg)
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin',   '*');
-  res.header('Access-Control-Allow-Methods',  'GET, POST, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers',  'Content-Type, X-Ndus, X-JsToken, X-AppId, X-BrowserId, X-UploadId');
-  res.header('Cross-Origin-Resource-Policy',  'cross-origin');  // ← requis par COEP du SW
+  res.header('Access-Control-Allow-Origin',  '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Cross-Origin-Resource-Policy', 'cross-origin');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// Headers communs Terabox
 function teraboxHeaders(ndus, browserId) {
   return {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
     'Accept':     'application/json, text/javascript, */*; q=0.01',
     'Referer':    'https://www.terabox.com/disk/home',
     'Origin':     'https://www.terabox.com',
@@ -39,216 +35,131 @@ function teraboxHeaders(ndus, browserId) {
   };
 }
 
-// Fetch avec timeout configurable (0 = pas de timeout)
-function fetchWithTimeout(url, opts = {}, ms = 60000) {
-  if (!ms) return fetch(url, opts);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return fetch(url, { ...opts, signal: controller.signal })
-    .finally(() => clearTimeout(timer));
+async function teraFetch(url, opts = {}) {
+  const r = await fetch(url, opts);
+  const text = await r.text();
+  try { return JSON.parse(text); }
+  catch { throw new Error('Non-JSON: ' + text.slice(0, 300)); }
 }
 
-// ── PRECREATE ─────────────────────────────────────────────────────────
-// POST /terabox/precreate
-app.post('/terabox/precreate', async (req, res) => {
-  const { ndus, jsToken, appId, browserId, path, size, blockList } = req.body;
-  try {
-    const params = new URLSearchParams({
-      channel: 'dubox', web: '1', app_id: appId || '250528',
-      clienttype: '0', jsToken,
-    });
-    const body = new URLSearchParams({
-      path, size: String(size), isdir: '0', autoinit: '1', rtype: '1',
-      block_list: JSON.stringify(blockList || ['5910a591dd8fc18c32a8f3df4ad24ea8']),
-    });
-    const r = await fetchWithTimeout(
-      `https://www.terabox.com/api/precreate?${params}`,
-      { method: 'POST', headers: { ...teraboxHeaders(ndus, browserId), 'Content-Type': 'application/x-www-form-urlencoded' }, body }
-    );
-    const text = await r.text();
-    console.log(`[precreate] status=${r.status} body=${text.slice(0,300)}`);
-    try { res.json(JSON.parse(text)); } catch { res.status(502).json({ error: 'Réponse non-JSON', raw: text.slice(0,500) }); }
-  } catch (e) {
-    console.error('[precreate] error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
+function md5(buffer) {
+  return crypto.createHash('md5').update(buffer).digest('hex');
+}
 
-// ── UPLOAD CHUNK ──────────────────────────────────────────────────────
-// POST /terabox/upload — reçoit le chunk en base64
-app.post('/terabox/upload', express.json({ limit: '50gb' }), async (req, res) => {
-  const { ndus, jsToken, appId, browserId, uploadId, path, partseq, chunkBase64, md5 } = req.body;
+// ── UPLOAD COMPLET EN UNE SEULE REQUÊTE ───────────────────────────────
+app.post('/terabox/upload-full', upload.single('file'), async (req, res) => {
+  const { ndus, jsToken, appId, browserId, remotePath } = req.body;
+  const fileBuffer = req.file?.buffer;
 
-  // Validation rapide
-  if (!chunkBase64) return res.status(400).json({ error: 'chunkBase64 manquant — body mal parsé ou requête tronquée' });
-  if (!uploadId)    return res.status(400).json({ error: 'uploadId manquant' });
+  if (!fileBuffer)     return res.status(400).json({ error: 'Fichier manquant' });
+  if (!ndus || !jsToken) return res.status(400).json({ error: 'Credentials manquants' });
+
+  const fileSize    = fileBuffer.length;
+  const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+  console.log(`[upload] ${req.file.originalname} — ${fileSize} bytes — ${totalChunks} chunks`);
 
   try {
-    // Décoder le chunk base64
-    const chunkBuffer = Buffer.from(chunkBase64, 'base64');
-    console.log(`[upload] partseq=${partseq} chunkSize=${chunkBuffer.length} bytes uploadId=${uploadId}`);
+    // Précréation
+    const preParams = new URLSearchParams({ channel:'dubox', web:'1', app_id: appId||'250528', clienttype:'0', jsToken });
+    const preBody   = new URLSearchParams({ path: remotePath, size: String(fileSize), isdir:'0', autoinit:'1', rtype:'1', block_list: JSON.stringify(['5910a591dd8fc18c32a8f3df4ad24ea8']) });
+    const pre = await teraFetch(`https://www.terabox.com/api/precreate?${preParams}`, { method:'POST', headers:{...teraboxHeaders(ndus,browserId),'Content-Type':'application/x-www-form-urlencoded'}, body:preBody });
+    if (pre.errno && pre.errno !== 0) throw new Error('Precreate errno=' + pre.errno + ' — ' + JSON.stringify(pre));
+    const uploadId = pre.uploadid;
 
-    // Construire le FormData manuellement
-    const boundary = '----TeraboxBoundary' + Date.now();
-    const body = Buffer.concat([
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="blob"\r\nContent-Type: application/octet-stream\r\n\r\n`),
-      chunkBuffer,
-      Buffer.from(`\r\n--${boundary}--\r\n`),
-    ]);
+    // Upload des chunks (côté serveur, pas de base64, binaire direct)
+    const blockList = [];
+    for (let i = 0; i < totalChunks; i++) {
+      const start    = i * CHUNK_SIZE;
+      const chunk    = fileBuffer.slice(start, Math.min(start + CHUNK_SIZE, fileSize));
+      const chunkMd5 = md5(chunk);
+      blockList.push(chunkMd5);
 
-    const params = new URLSearchParams({
-      method: 'upload', app_id: appId || '250528',
-      channel: 'dubox', clienttype: '0', web: '1',
-      jsToken, path, uploadid: uploadId,
-      partseq: String(partseq),
-    });
+      const boundary = '----TB' + Date.now();
+      const body = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="blob"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+        chunk,
+        Buffer.from(`\r\n--${boundary}--\r\n`),
+      ]);
+      const params = new URLSearchParams({ method:'upload', app_id:appId||'250528', channel:'dubox', clienttype:'0', web:'1', jsToken, path:remotePath, uploadid:uploadId, partseq:String(i) });
 
-    const r = await fetchWithTimeout(
-      `https://c-jp.terabox.com/rest/2.0/pcs/superfile2?${params}`,
-      {
-        method: 'POST',
-        headers: {
-          ...teraboxHeaders(ndus, browserId),
-          'Content-Type': `multipart/form-data; boundary=${boundary}`,
-          'Content-Length': String(body.length),
-        },
-        body,
-      },
-      0  // pas de timeout — durée variable selon taille du chunk
-    );
-
-    const text = await r.text();
-    console.log(`[upload] Terabox response status=${r.status} body=${text.slice(0, 200)}`);
-    try {
-      res.json(JSON.parse(text));
-    } catch {
-      res.status(502).json({ error: 'Réponse non-JSON de Terabox', raw: text.slice(0, 500) });
+      let ok = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const up = await teraFetch(`https://c-jp.terabox.com/rest/2.0/pcs/superfile2?${params}`, {
+            method:'POST',
+            headers:{...teraboxHeaders(ndus,browserId), 'Content-Type':`multipart/form-data; boundary=${boundary}`, 'Content-Length':String(body.length)},
+            body,
+          });
+          if (up.error_code && up.error_code !== 0) throw new Error('error_code=' + up.error_code);
+          console.log(`  chunk ${i+1}/${totalChunks} ✓`);
+          ok = true; break;
+        } catch(e) {
+          console.warn(`  chunk ${i+1} tentative ${attempt}/3: ${e.message}`);
+          if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
+          else throw new Error(`Chunk ${i+1}/${totalChunks} échoué: ${e.message}`);
+        }
+      }
     }
-  } catch (e) {
-    console.error('[upload] error:', e.message);
+
+    // Finalisation
+    const createParams = new URLSearchParams({ method:'create', app_id:appId||'250528', channel:'dubox', clienttype:'0', web:'1', jsToken });
+    const createBody   = new URLSearchParams({ path:remotePath, size:String(fileSize), isdir:'0', rtype:'1', uploadid:uploadId, block_list:JSON.stringify(blockList) });
+    const create = await teraFetch(`https://www.terabox.com/api/create?${createParams}`, { method:'POST', headers:{...teraboxHeaders(ndus,browserId),'Content-Type':'application/x-www-form-urlencoded'}, body:createBody });
+    if (create.errno && create.errno !== 0) throw new Error('Create errno=' + create.errno);
+
+    console.log(`[upload] ✅ fsId=${create.fs_id || create.fsid}`);
+    res.json({ ok: true, fsId: create.fs_id || create.fsid, path: remotePath });
+
+  } catch(e) {
+    console.error('[upload] ❌', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── CREATE (finalise l'upload) ────────────────────────────────────────
-// POST /terabox/create
-app.post('/terabox/create', async (req, res) => {
-  const { ndus, jsToken, appId, browserId, path, size, uploadId, blockList } = req.body;
-  try {
-    const params = new URLSearchParams({
-      method: 'create', app_id: appId || '250528',
-      channel: 'dubox', clienttype: '0', web: '1', jsToken,
-    });
-    const body = new URLSearchParams({
-      path, size: String(size), isdir: '0', rtype: '1',
-      uploadid: uploadId,
-      block_list: JSON.stringify(blockList),
-    });
-    const r = await fetchWithTimeout(
-      `https://www.terabox.com/api/create?${params}`,
-      { method: 'POST', headers: { ...teraboxHeaders(ndus, browserId), 'Content-Type': 'application/x-www-form-urlencoded' }, body }
-    );
-    res.json(await r.json());
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── DOWNLOAD LINK ─────────────────────────────────────────────────────
-// GET /terabox/dlink?fsId=xxx&ndus=xxx&jsToken=xxx&appId=xxx
+// ── DOWNLOAD LINK ──────────────────────────────────────────────────────
 app.get('/terabox/dlink', async (req, res) => {
   const { fsId, ndus, jsToken, appId, browserId } = req.query;
   try {
-    const params = new URLSearchParams({
-      method: 'filemetas', app_id: appId || '250528',
-      web: '1', channel: 'dubox', clienttype: '0',
-      jsToken, dlink: '1', fsids: JSON.stringify([parseInt(fsId)]),
-    });
-    const r = await fetchWithTimeout(
-      `https://www.terabox.com/api/filemetas?${params}`,
-      { headers: teraboxHeaders(ndus, browserId) }
-    );
-    const data = await r.json();
+    const params = new URLSearchParams({ method:'filemetas', app_id:appId||'250528', web:'1', channel:'dubox', clienttype:'0', jsToken, dlink:'1', fsids:JSON.stringify([parseInt(fsId)]) });
+    const data = await teraFetch(`https://www.terabox.com/api/filemetas?${params}`, { headers:teraboxHeaders(ndus,browserId) });
     const dlink = data?.list?.[0]?.dlink;
-    if (!dlink) return res.status(404).json({ error: 'No dlink found', raw: data });
-
-    // Résoudre la redirection du dlink
-    const r2 = await fetchWithTimeout(dlink, {
-      headers: teraboxHeaders(ndus, browserId),
-      redirect: 'manual',
-    });
-    const finalUrl = r2.headers.get('location') || dlink;
-    res.json({ dlink: finalUrl });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    if (!dlink) return res.status(404).json({ error:'No dlink', raw:data });
+    const r2 = await fetch(dlink, { headers:teraboxHeaders(ndus,browserId), redirect:'manual' });
+    res.json({ dlink: r2.headers.get('location') || dlink });
+  } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-// ── LIST FILES ────────────────────────────────────────────────────────
-// GET /terabox/list?dir=/MaCinematheque&ndus=xxx&jsToken=xxx&appId=xxx
+// ── LIST ───────────────────────────────────────────────────────────────
 app.get('/terabox/list', async (req, res) => {
   const { dir, ndus, jsToken, appId, browserId } = req.query;
   try {
-    const params = new URLSearchParams({
-      method: 'list', app_id: appId || '250528',
-      web: '1', channel: 'dubox', clienttype: '0',
-      jsToken, dir: dir || '/',
-      num: '1000', page: '1', order: 'time', desc: '1',
-    });
-    const r = await fetchWithTimeout(
-      `https://www.terabox.com/api/list?${params}`,
-      { headers: teraboxHeaders(ndus, browserId) }
-    );
-    res.json(await r.json());
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const params = new URLSearchParams({ method:'list', app_id:appId||'250528', web:'1', channel:'dubox', clienttype:'0', jsToken, dir:dir||'/', num:'1000', page:'1', order:'time', desc:'1' });
+    res.json(await teraFetch(`https://www.terabox.com/api/list?${params}`, { headers:teraboxHeaders(ndus,browserId) }));
+  } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-// ── DELETE FILES ──────────────────────────────────────────────────────
-// POST /terabox/delete
+// ── DELETE ─────────────────────────────────────────────────────────────
 app.post('/terabox/delete', async (req, res) => {
   const { ndus, jsToken, appId, browserId, filelist } = req.body;
   try {
-    const params = new URLSearchParams({
-      method: 'delete', app_id: appId || '250528',
-      web: '1', channel: 'dubox', clienttype: '0', jsToken,
-    });
-    const body = new URLSearchParams({
-      filelist: JSON.stringify(filelist),
-      ondup: 'fail', async: '0', onnewver: 'fail',
-    });
-    const r = await fetchWithTimeout(
-      `https://www.terabox.com/api/filemanager?${params}`,
-      { method: 'POST', headers: { ...teraboxHeaders(ndus, browserId), 'Content-Type': 'application/x-www-form-urlencoded' }, body }
-    );
-    res.json(await r.json());
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const params = new URLSearchParams({ method:'delete', app_id:appId||'250528', web:'1', channel:'dubox', clienttype:'0', jsToken });
+    const body   = new URLSearchParams({ filelist:JSON.stringify(filelist), ondup:'fail', async:'0', onnewver:'fail' });
+    res.json(await teraFetch(`https://www.terabox.com/api/filemanager?${params}`, { method:'POST', headers:{...teraboxHeaders(ndus,browserId),'Content-Type':'application/x-www-form-urlencoded'}, body }));
+  } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-// ── MKDIR ─────────────────────────────────────────────────────────────
+// ── MKDIR ──────────────────────────────────────────────────────────────
 app.post('/terabox/mkdir', async (req, res) => {
   const { ndus, jsToken, appId, browserId, path } = req.body;
   try {
-    const params = new URLSearchParams({
-      method: 'create', app_id: appId || '250528',
-      web: '1', channel: 'dubox', clienttype: '0', jsToken,
-    });
-    const body = new URLSearchParams({ path, isdir: '1', rtype: '0' });
-    const r = await fetchWithTimeout(
-      `https://www.terabox.com/api/create?${params}`,
-      { method: 'POST', headers: { ...teraboxHeaders(ndus, browserId), 'Content-Type': 'application/x-www-form-urlencoded' }, body }
-    );
-    res.json(await r.json());
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const params = new URLSearchParams({ method:'create', app_id:appId||'250528', web:'1', channel:'dubox', clienttype:'0', jsToken });
+    const body   = new URLSearchParams({ path, isdir:'1', rtype:'0' });
+    res.json(await teraFetch(`https://www.terabox.com/api/create?${params}`, { method:'POST', headers:{...teraboxHeaders(ndus,browserId),'Content-Type':'application/x-www-form-urlencoded'}, body }));
+  } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-// ── HEALTH CHECK ──────────────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ ok: true, service: 'MaCinema Terabox Proxy' }));
+// ── HEALTH ─────────────────────────────────────────────────────────────
+app.get('/health', (_, res) => res.json({ ok:true, service:'MaCinema Proxy v2' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy v2 on port ${PORT}`));

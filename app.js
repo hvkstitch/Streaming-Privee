@@ -21,10 +21,7 @@ const CONFIG = {
   supabaseAnon: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9saGZkdXFueGhhb2F4Y3hqeHhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIxMDI3NTgsImV4cCI6MjA4NzY3ODc1OH0.gJokdFbBt5k9DuHBkMRtxhHcNQNJlyOjXnXMNu-Q-1k',
 };
 
-// Taille de chaque chunk d'upload : 10 MB
-// (le chunk est encodé en base64 → x1.33, soit ~13 MB de JSON au proxy)
-// Render free tier coupe à 30s → 10 MB est le bon compromis vitesse/fiabilité
-const CHUNK_SIZE = 10 * 1024 * 1024;
+// (Le découpage en chunks est géré côté serveur)
 
 // =====================================================================
 // Supabase helpers
@@ -89,58 +86,6 @@ const tera = {
     return r.json();
   },
 
-  /** Calcule le vrai MD5 d'un ArrayBuffer (requis par l'API Terabox) */
-  async md5(buffer) {
-    // crypto.subtle ne supporte pas MD5 (obsolète) — implémentation JS pure
-    function md5js(buf) {
-      const b = new Uint8Array(buf);
-      function safeAdd(x, y) { const l = (x & 0xffff) + (y & 0xffff); return (((x >> 16) + (y >> 16) + (l >> 16)) << 16) | (l & 0xffff); }
-      function rol(n, c) { return (n << c) | (n >>> (32 - c)); }
-      function cmn(q, a, b, x, s, t) { return safeAdd(rol(safeAdd(safeAdd(a, q), safeAdd(x, t)), s), b); }
-      function ff(a,b,c,d,x,s,t){ return cmn((b&c)|((~b)&d),a,b,x,s,t); }
-      function gg(a,b,c,d,x,s,t){ return cmn((b&d)|(c&(~d)),a,b,x,s,t); }
-      function hh(a,b,c,d,x,s,t){ return cmn(b^c^d,a,b,x,s,t); }
-      function ii(a,b,c,d,x,s,t){ return cmn(c^(b|(~d)),a,b,x,s,t); }
-      const orig = b.length;
-      const len  = orig + 1;
-      const extra = (len % 64 < 56 ? 56 - len % 64 : 120 - len % 64);
-      const padded = new Uint8Array(len + extra + 8);
-      padded.set(b); padded[orig] = 0x80;
-      const bits = orig * 8;
-      padded[len + extra]     = bits & 0xff;
-      padded[len + extra + 1] = (bits >>> 8)  & 0xff;
-      padded[len + extra + 2] = (bits >>> 16) & 0xff;
-      padded[len + extra + 3] = (bits >>> 24) & 0xff;
-      const words = new Int32Array(padded.buffer);
-      let a = 0x67452301, bv = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
-      for (let i = 0; i < words.length; i += 16) {
-        const [oa,ob,oc,od] = [a,bv,c,d];
-        a=ff(a,bv,c,d,words[i+0],7,-680876936);d=ff(d,a,bv,c,words[i+1],12,-389564586);c=ff(c,d,a,bv,words[i+2],17,606105819);bv=ff(bv,c,d,a,words[i+3],22,-1044525330);
-        a=ff(a,bv,c,d,words[i+4],7,-176418897);d=ff(d,a,bv,c,words[i+5],12,1200080426);c=ff(c,d,a,bv,words[i+6],17,-1473231341);bv=ff(bv,c,d,a,words[i+7],22,-45705983);
-        a=ff(a,bv,c,d,words[i+8],7,1770035416);d=ff(d,a,bv,c,words[i+9],12,-1958414417);c=ff(c,d,a,bv,words[i+10],17,-42063);bv=ff(bv,c,d,a,words[i+11],22,-1990404162);
-        a=ff(a,bv,c,d,words[i+12],7,1804603682);d=ff(d,a,bv,c,words[i+13],12,-40341101);c=ff(c,d,a,bv,words[i+14],17,-1502002290);bv=ff(bv,c,d,a,words[i+15],22,1236535329);
-        a=gg(a,bv,c,d,words[i+1],5,-165796510);d=gg(d,a,bv,c,words[i+6],9,-1069501632);c=gg(c,d,a,bv,words[i+11],14,643717713);bv=gg(bv,c,d,a,words[i+0],20,-373897302);
-        a=gg(a,bv,c,d,words[i+5],5,-701558691);d=gg(d,a,bv,c,words[i+10],9,38016083);c=gg(c,d,a,bv,words[i+15],14,-660478335);bv=gg(bv,c,d,a,words[i+4],20,-405537848);
-        a=gg(a,bv,c,d,words[i+9],5,568446438);d=gg(d,a,bv,c,words[i+14],9,-1019803690);c=gg(c,d,a,bv,words[i+3],14,-187363961);bv=gg(bv,c,d,a,words[i+8],20,1163531501);
-        a=gg(a,bv,c,d,words[i+13],5,-1444681467);d=gg(d,a,bv,c,words[i+2],9,-51403784);c=gg(c,d,a,bv,words[i+7],14,1735328473);bv=gg(bv,c,d,a,words[i+12],20,-1926607734);
-        a=hh(a,bv,c,d,words[i+5],4,-378558);d=hh(d,a,bv,c,words[i+8],11,-2022574463);c=hh(c,d,a,bv,words[i+11],16,1839030562);bv=hh(bv,c,d,a,words[i+14],23,-35309556);
-        a=hh(a,bv,c,d,words[i+1],4,-1530992060);d=hh(d,a,bv,c,words[i+4],11,1272893353);c=hh(c,d,a,bv,words[i+7],16,-155497632);bv=hh(bv,c,d,a,words[i+10],23,-1094730640);
-        a=hh(a,bv,c,d,words[i+13],4,681279174);d=hh(d,a,bv,c,words[i+0],11,-358537222);c=hh(c,d,a,bv,words[i+3],16,-722521979);bv=hh(bv,c,d,a,words[i+6],23,76029189);
-        a=hh(a,bv,c,d,words[i+9],4,-640364487);d=hh(d,a,bv,c,words[i+12],11,-421815835);c=hh(c,d,a,bv,words[i+15],16,530742520);bv=hh(bv,c,d,a,words[i+2],23,-995338651);
-        a=ii(a,bv,c,d,words[i+0],6,-198630844);d=ii(d,a,bv,c,words[i+7],10,1126891415);c=ii(c,d,a,bv,words[i+14],15,-1416354905);bv=ii(bv,c,d,a,words[i+5],21,-57434055);
-        a=ii(a,bv,c,d,words[i+12],6,1700485571);d=ii(d,a,bv,c,words[i+3],10,-1894986606);c=ii(c,d,a,bv,words[i+10],15,-1051523);bv=ii(bv,c,d,a,words[i+1],21,-2054922799);
-        a=ii(a,bv,c,d,words[i+8],6,1873313359);d=ii(d,a,bv,c,words[i+15],10,-30611744);c=ii(c,d,a,bv,words[i+6],15,-1560198380);bv=ii(bv,c,d,a,words[i+13],21,1309151649);
-        a=ii(a,bv,c,d,words[i+4],6,-145523070);d=ii(d,a,bv,c,words[i+11],10,-1120210379);c=ii(c,d,a,bv,words[i+2],15,718787259);bv=ii(bv,c,d,a,words[i+9],21,-343485551);
-        a=safeAdd(a,oa);bv=safeAdd(bv,ob);c=safeAdd(c,oc);d=safeAdd(d,od);
-      }
-      const out = new Uint8Array(16);
-      new DataView(out.buffer).setInt32(0,a,true); new DataView(out.buffer).setInt32(4,bv,true);
-      new DataView(out.buffer).setInt32(8,c,true); new DataView(out.buffer).setInt32(12,d,true);
-      return out;
-    }
-    return Array.from(md5js(buffer)).map(b => b.toString(16).padStart(2,'0')).join('');
-  },
-
   /** Réveille le proxy Render (cold start ~30s sur plan gratuit) */
   async wakeUp() {
     showSyncBanner('⏳ Réveil du serveur (Render cold start)...');
@@ -153,82 +98,51 @@ const tera = {
     hideSyncBanner();
   },
 
-  /** Upload complet d'un fichier vers Terabox (multipart) */
+  /** Upload complet — UNE seule requête binaire FormData vers le proxy
+   *  C'est le serveur qui découpe en chunks vers Terabox, pas le navigateur */
   async upload(file, remotePath, onProgress) {
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    const blockList   = [];
-    const startTime   = Date.now();
+    onProgress(10, 'Envoi vers le proxy...');
+    updateDiag('terabox', 'pending', `⬆ Envoi de ${formatSize(file.size)}...`);
 
-    // Étape 1 : précréer
-    onProgress(0, `Précréation Terabox (${totalChunks} chunks)...`);
-    updateDiag('terabox', 'pending', `⏳ Précréation (${formatSize(file.size)}, ${totalChunks} chunks)...`);
+    const form = new FormData();
+    form.append('file',       file, file.name);
+    form.append('ndus',       CONFIG.ndus);
+    form.append('jsToken',    CONFIG.jsToken);
+    form.append('appId',      CONFIG.appId);
+    form.append('browserId',  CONFIG.browserId);
+    form.append('remotePath', remotePath);
 
-    const pre = await this.post('precreate', {
-      path:      remotePath,
-      size:      file.size,
-      blockList: ['5910a591dd8fc18c32a8f3df4ad24ea8'],
+    // Simuler une progression pendant l'envoi (xhr avec progress réel)
+    const result = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${CONFIG.proxyUrl}/terabox/upload-full`);
+      xhr.timeout = 0; // pas de timeout
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 80) + 10;
+          const speed = e.loaded > 0 ? formatSize(e.loaded / ((Date.now() - startTime) / 1000)) + '/s' : '...';
+          onProgress(pct, `Envoi ${formatSize(e.loaded)} / ${formatSize(e.total)} — ${speed}`);
+          updateDiag('terabox', 'pending', `⬆ ${formatSize(e.loaded)} / ${formatSize(e.total)} — ${speed}`);
+        }
+      };
+
+      xhr.onload = () => {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          if (xhr.status !== 200 || data.error) reject(new Error(data.error || 'Erreur serveur ' + xhr.status));
+          else resolve(data);
+        } catch { reject(new Error('Réponse invalide: ' + xhr.responseText.slice(0, 200))); }
+      };
+      xhr.onerror   = () => reject(new Error('Réseau : impossible de joindre le proxy'));
+      xhr.ontimeout = () => reject(new Error('Timeout proxy'));
+
+      const startTime = Date.now();
+      xhr.send(form);
     });
 
-    if (pre.errno && pre.errno !== 0) throw new Error('Precreate échoué errno=' + pre.errno + ' : ' + JSON.stringify(pre));
-    const uploadId = pre.uploadid;
-
-    // Étape 2 : upload des chunks avec retry
-    for (let i = 0; i < totalChunks; i++) {
-      const start  = i * CHUNK_SIZE;
-      const end    = Math.min(start + CHUNK_SIZE, file.size);
-      const chunk  = file.slice(start, end);
-      const buffer = await chunk.arrayBuffer();
-      const md5    = await this.md5(buffer);
-      blockList.push(md5);
-
-      // Encoder en base64 par sous-blocs de 8 KB (évite stack overflow)
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      const BTOA_CHUNK = 8192;
-      for (let j = 0; j < bytes.length; j += BTOA_CHUNK) {
-        binary += String.fromCharCode(...bytes.subarray(j, Math.min(j + BTOA_CHUNK, bytes.length)));
-      }
-      const base64 = btoa(binary);
-
-      // Calcul vitesse
-      const elapsed  = (Date.now() - startTime) / 1000;
-      const uploaded  = start;
-      const speed     = elapsed > 1 ? uploaded / elapsed : 0;
-      const remaining = speed > 0 ? (file.size - uploaded) / speed : 0;
-      const speedStr  = speed > 0 ? formatSize(speed) + '/s' : '...';
-      const pct       = Math.round(((i + 0.5) / totalChunks) * 90);
-
-      const label = `Chunk ${i + 1}/${totalChunks} — ${speedStr} — reste ~${formatDuration(remaining)}`;
-      onProgress(pct, label);
-      updateDiag('terabox', 'pending', `⬆ ${i + 1}/${totalChunks} chunks — ${speedStr}`);
-
-      // Upload avec retry (3 tentatives)
-      let lastErr;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          const up = await this.post('upload', {
-            path: remotePath, uploadId, partseq: i, chunkBase64: base64, md5,
-          });
-          if (up.error_code && up.error_code !== 0) throw new Error('error_code=' + up.error_code);
-          lastErr = null;
-          break;
-        } catch (e) {
-          lastErr = e;
-          updateDiag('terabox', 'pending', `⚠ Chunk ${i + 1} tentative ${attempt}/3 — ${e.message.slice(0, 60)}`);
-          if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
-        }
-      }
-      if (lastErr) throw new Error(`Chunk ${i + 1}/${totalChunks} échoué après 3 tentatives : ${lastErr.message}`);
-    }
-
-    // Étape 3 : finaliser
     onProgress(95, 'Finalisation Terabox...');
-    updateDiag('terabox', 'pending', '⏳ Finalisation...');
-    const create = await this.post('create', { path: remotePath, size: file.size, uploadId, blockList });
-    if (create.errno && create.errno !== 0) throw new Error('Create échoué errno=' + create.errno + ' : ' + JSON.stringify(create));
-
-    onProgress(100, 'Upload terminé !');
-    return { fsId: create.fs_id || create.fsid, path: remotePath };
+    return { fsId: result.fsId, path: remotePath };
   },
 
   /** Créer le dossier si besoin */
