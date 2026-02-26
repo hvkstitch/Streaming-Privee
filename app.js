@@ -1,91 +1,212 @@
 /* =====================================================================
-   MaCinémathèque — app.js
-   v3: Supabase sync (métadonnées en DB + fichiers vidéo dans Storage)
-       Collection partagée entre tous les appareils, sans compte.
+   MaCinémathèque — app.js  v4
+   Stockage vidéo : Terabox (1 TB gratuit) via proxy Render
+   Métadonnées    : Supabase
+   Cache local    : IndexedDB
+   Conversion     : FFmpeg.wasm (AVI, MKV, MOV, etc.)
    ===================================================================== */
 
 // =====================================================================
-// Supabase Config
+// CONFIG — À remplir
 // =====================================================================
 
-const SUPABASE_URL  = 'https://olhfduqnxhaoaxcxjxxi.supabase.co';
-const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9saGZkdXFueGhhb2F4Y3hqeHhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIxMDI3NTgsImV4cCI6MjA4NzY3ODc1OH0.gJokdFbBt5k9DuHBkMRtxhHcNQNJlyOjXnXMNu-Q-1k';
-const BUCKET = 'movies';
-const TABLE  = 'movies';
+const CONFIG = {
+  // URL de ton proxy Render (après déploiement)
+  // ex: 'https://macinema-proxy.onrender.com'
+  proxyUrl: 'https://TON-PROXY.onrender.com',
+
+  // Terabox credentials (à renouveler tous les ~30 jours)
+  // Guide : voir README ou section "Comment obtenir" plus bas
+  ndus:      '',
+  jsToken:   '',
+  appId:     '250528',
+  browserId: '',
+  uploadId:  '',
+
+  // Dossier Terabox où stocker les films
+  remoteDir: '/MaCinematheque',
+
+  // Supabase
+  supabaseUrl:  'https://olhfduqnxhaoaxcxjxxi.supabase.co',
+  supabaseAnon: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9saGZkdXFueGhhb2F4Y3hqeHhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIxMDI3NTgsImV4cCI6MjA4NzY3ODc1OH0.gJokdFbBt5k9DuHBkMRtxhHcNQNJlyOjXnXMNu-Q-1k',
+};
+
+// Taille de chaque chunk d'upload : 20 MB
+const CHUNK_SIZE = 20 * 1024 * 1024;
+
+// =====================================================================
+// Supabase helpers
+// =====================================================================
 
 const supa = {
-  headers: {
-    'apikey':        SUPABASE_ANON,
-    'Authorization': 'Bearer ' + SUPABASE_ANON,
+  h: () => ({
+    'apikey':        CONFIG.supabaseAnon,
+    'Authorization': 'Bearer ' + CONFIG.supabaseAnon,
     'Content-Type':  'application/json',
+  }),
+  async select(q = '') {
+    const r = await fetch(`${CONFIG.supabaseUrl}/rest/v1/movies?${q}`, { headers: this.h() });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
   },
-
-  async select(table, query = '') {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${query}`, { headers: this.headers });
-    if (!res.ok) throw new Error(await res.text());
-    return res.json();
-  },
-
-  async insert(table, row) {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
-      method:  'POST',
-      headers: { ...this.headers, 'Prefer': 'return=representation' },
-      body:    JSON.stringify(row),
+  async insert(row) {
+    const r = await fetch(`${CONFIG.supabaseUrl}/rest/v1/movies`, {
+      method: 'POST',
+      headers: { ...this.h(), 'Prefer': 'return=representation' },
+      body: JSON.stringify(row),
     });
-    if (!res.ok) throw new Error(await res.text());
-    return res.json();
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
   },
-
-  async delete(table, filter) {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${filter}`, {
-      method:  'DELETE',
-      headers: this.headers,
+  async delete(id) {
+    const r = await fetch(`${CONFIG.supabaseUrl}/rest/v1/movies?id=eq.${id}`, {
+      method: 'DELETE', headers: this.h(),
     });
-    if (!res.ok) throw new Error(await res.text());
-  },
-
-  async deleteFile(path) {
-    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}`, {
-      method:  'DELETE',
-      headers: { ...this.headers },
-      body:    JSON.stringify({ prefixes: [path] }),
-    });
-    if (!res.ok) throw new Error(await res.text());
-  },
-
-  fileUrl(path) {
-    return `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${path}`;
+    if (!r.ok) throw new Error(await r.text());
   },
 };
 
 // =====================================================================
-// IndexedDB — cache local (lecture rapide sans re-téléchargement)
+// Terabox helpers (via proxy)
 // =====================================================================
 
-const DB_NAME    = 'macinema_db';
-const DB_VERSION = 1;
-const STORE_BLOB = 'movies_blobs';
-let   idb        = null;
+const tera = {
+  creds() {
+    return {
+      ndus:      CONFIG.ndus,
+      jsToken:   CONFIG.jsToken,
+      appId:     CONFIG.appId,
+      browserId: CONFIG.browserId,
+      uploadId:  CONFIG.uploadId,
+    };
+  },
+
+  async post(endpoint, body) {
+    const r = await fetch(`${CONFIG.proxyUrl}/terabox/${endpoint}`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ ...this.creds(), ...body }),
+    });
+    if (!r.ok) throw new Error(`Proxy error ${r.status}: ${await r.text()}`);
+    return r.json();
+  },
+
+  async get(endpoint, params = {}) {
+    const q = new URLSearchParams({ ...this.creds(), ...params });
+    const r = await fetch(`${CONFIG.proxyUrl}/terabox/${endpoint}?${q}`);
+    if (!r.ok) throw new Error(`Proxy error ${r.status}: ${await r.text()}`);
+    return r.json();
+  },
+
+  /** Calcule le MD5 d'un ArrayBuffer */
+  async md5(buffer) {
+    const hash = await crypto.subtle.digest('SHA-256', buffer);
+    // Terabox accepte SHA-256 comme "md5" pour les blocs
+    return Array.from(new Uint8Array(hash))
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+  },
+
+  /** Upload complet d'un fichier vers Terabox (multipart) */
+  async upload(file, remotePath, onProgress) {
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const blockList   = [];
+
+    // Étape 1 : précréer
+    onProgress(0, 'Précréation Terabox...');
+    const pre = await this.post('precreate', {
+      path:      remotePath,
+      size:      file.size,
+      blockList: ['5910a591dd8fc18c32a8f3df4ad24ea8'], // MD5 fictif pour précréation
+    });
+
+    if (pre.errno && pre.errno !== 0) throw new Error('Precreate échoué : ' + JSON.stringify(pre));
+    const uploadId = pre.uploadid;
+
+    // Étape 2 : upload des chunks
+    for (let i = 0; i < totalChunks; i++) {
+      const start  = i * CHUNK_SIZE;
+      const end    = Math.min(start + CHUNK_SIZE, file.size);
+      const chunk  = file.slice(start, end);
+      const buffer = await chunk.arrayBuffer();
+      const md5    = await this.md5(buffer);
+      blockList.push(md5);
+
+      // Encoder le chunk en base64 pour l'envoyer au proxy
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+
+      const pct = Math.round(((i + 1) / totalChunks) * 85);
+      onProgress(pct, `Upload ${i + 1}/${totalChunks} (${Math.round(end / 1024 / 1024)} MB)...`);
+
+      const up = await this.post('upload', {
+        path:        remotePath,
+        uploadId,
+        partseq:     i,
+        chunkBase64: base64,
+        md5,
+      });
+
+      if (up.error_code) throw new Error('Upload chunk échoué : ' + JSON.stringify(up));
+    }
+
+    // Étape 3 : finaliser
+    onProgress(90, 'Finalisation...');
+    const create = await this.post('create', {
+      path:      remotePath,
+      size:      file.size,
+      uploadId,
+      blockList,
+    });
+
+    if (create.errno && create.errno !== 0) throw new Error('Create échoué : ' + JSON.stringify(create));
+
+    onProgress(100, 'Upload terminé !');
+    return { fsId: create.fs_id || create.fsid, path: remotePath };
+  },
+
+  /** Obtenir le lien de téléchargement direct depuis fsId */
+  async getDlink(fsId) {
+    const data = await this.get('dlink', { fsId });
+    if (!data.dlink) throw new Error('Pas de dlink');
+    return data.dlink;
+  },
+
+  /** Supprimer un fichier */
+  async deleteFile(path) {
+    return this.post('delete', { filelist: [path] });
+  },
+
+  /** Créer le dossier si besoin */
+  async ensureDir() {
+    try { await this.post('mkdir', { path: CONFIG.remoteDir }); } catch {}
+  },
+};
+
+// =====================================================================
+// IndexedDB — cache local
+// =====================================================================
+
+const DB_NAME = 'macinema_db';
+let   idb     = null;
 
 function openIDB() {
-  return new Promise((resolve, reject) => {
-    if (idb) return resolve(idb);
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+  return new Promise((res, rej) => {
+    if (idb) return res(idb);
+    const req = indexedDB.open(DB_NAME, 1);
     req.onupgradeneeded = e => {
       const d = e.target.result;
-      if (!d.objectStoreNames.contains(STORE_BLOB))
-        d.createObjectStore(STORE_BLOB, { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('blobs'))
+        d.createObjectStore('blobs', { keyPath: 'id' });
     };
-    req.onsuccess = e => { idb = e.target.result; resolve(idb); };
-    req.onerror   = e => reject(e.target.error);
+    req.onsuccess = e => { idb = e.target.result; res(idb); };
+    req.onerror   = e => rej(e.target.error);
   });
 }
 
-async function idbPut(value) {
+async function idbPut(id, blob) {
   const d = await openIDB();
   return new Promise((res, rej) => {
-    const tx  = d.transaction(STORE_BLOB, 'readwrite');
-    const req = tx.objectStore(STORE_BLOB).put(value);
+    const tx  = d.transaction('blobs', 'readwrite');
+    const req = tx.objectStore('blobs').put({ id, blob });
     req.onsuccess = () => res();
     req.onerror   = e => rej(e.target.error);
   });
@@ -94,8 +215,8 @@ async function idbPut(value) {
 async function idbGet(id) {
   const d = await openIDB();
   return new Promise((res, rej) => {
-    const tx  = d.transaction(STORE_BLOB, 'readonly');
-    const req = tx.objectStore(STORE_BLOB).get(id);
+    const tx  = d.transaction('blobs', 'readonly');
+    const req = tx.objectStore('blobs').get(id);
     req.onsuccess = e => res(e.target.result);
     req.onerror   = e => rej(e.target.error);
   });
@@ -104,8 +225,8 @@ async function idbGet(id) {
 async function idbDelete(id) {
   const d = await openIDB();
   return new Promise((res, rej) => {
-    const tx  = d.transaction(STORE_BLOB, 'readwrite');
-    const req = tx.objectStore(STORE_BLOB).delete(id);
+    const tx  = d.transaction('blobs', 'readwrite');
+    const req = tx.objectStore('blobs').delete(id);
     req.onsuccess = () => res();
     req.onerror   = e => rej(e.target.error);
   });
@@ -116,13 +237,12 @@ async function idbDelete(id) {
 // =====================================================================
 
 let movies       = [];
-const fileStore  = {};   // id → URL (blob local ou URL Supabase)
+const fileStore  = {};  // id → URL locale ou dlink Terabox
 let currentMovie = null;
 
 const convertStats = {
-  startTime: 0, lastFrameTime: 0, frameCount: 0,
-  bytesWritten: 0, lastByteTime: 0, lastBytes: 0,
-  speedMBs: 0, timerInterval: null,
+  startTime: 0, frameCount: 0, bytesWritten: 0,
+  lastBytes: 0, lastByteTime: 0, timerInterval: null,
 };
 
 // =====================================================================
@@ -130,18 +250,36 @@ const convertStats = {
 // =====================================================================
 
 (async function init() {
-  showSyncBanner('Connexion à Supabase...');
+  // Vérifier la config
+  if (!CONFIG.ndus || !CONFIG.jsToken) {
+    showConfigWarning();
+  }
+
+  showSyncBanner('Chargement de la collection...');
   setupDropzone();
 
   try {
-    await loadMoviesFromSupabase();
+    const rows = await supa.select('order=added_at.desc');
+    movies = rows.map(r => ({
+      id: r.id, name: r.name, title: r.title,
+      size: r.size, ext: r.ext, added: r.added,
+      terabox_path: r.terabox_path, fs_id: r.fs_id,
+    }));
+
+    // Restaurer URLs depuis cache local d'abord
+    for (const m of movies) {
+      try {
+        const cached = await idbGet(m.id);
+        if (cached?.blob) fileStore[m.id] = URL.createObjectURL(cached.blob);
+      } catch {}
+    }
+
     hideSyncBanner();
-    if (movies.length > 0) showToast(`✓ ${movies.length} film(s) synchronisé(s)`, 'success');
+    if (movies.length) showToast(`✓ ${movies.length} film(s) chargé(s)`, 'success');
   } catch (e) {
     hideSyncBanner();
-    showToast('⚠ Hors-ligne — Supabase inaccessible', 'error');
-    console.warn('Supabase error:', e);
-    movies = JSON.parse(localStorage.getItem('macinema_index') || '[]');
+    showToast('⚠ Impossible de charger la collection Supabase', 'error');
+    console.error(e);
   }
 
   renderGrid();
@@ -149,34 +287,24 @@ const convertStats = {
 })();
 
 // =====================================================================
-// Supabase — Chargement
+// Config Warning
 // =====================================================================
 
-async function loadMoviesFromSupabase() {
-  const rows = await supa.select(TABLE, 'order=added_at.desc');
-  movies = rows.map(r => ({
-    id:           r.id,
-    name:         r.name,
-    title:        r.title,
-    size:         r.size,
-    ext:          r.ext,
-    added:        r.added,
-    storage_path: r.storage_path,
-  }));
-
-  // Pour chaque film : cache local d'abord, sinon URL Supabase directe
-  for (const m of movies) {
-    try {
-      const cached = await idbGet(m.id);
-      if (cached && cached.blob) {
-        fileStore[m.id] = URL.createObjectURL(cached.blob);
-      } else if (m.storage_path) {
-        fileStore[m.id] = supa.fileUrl(m.storage_path);
-      }
-    } catch {
-      if (m.storage_path) fileStore[m.id] = supa.fileUrl(m.storage_path);
-    }
-  }
+function showConfigWarning() {
+  const banner = document.createElement('div');
+  banner.id = 'configBanner';
+  banner.style.cssText = `
+    position:fixed;bottom:0;left:0;right:0;z-index:9997;
+    background:#1a1200;border-top:2px solid #e8b86d;
+    padding:14px 48px;font-size:0.75rem;color:#e8b86d;
+    display:flex;align-items:center;gap:16px;
+  `;
+  banner.innerHTML = `
+    <span>⚙</span>
+    <span>Tokens Terabox non configurés. Remplis <strong>CONFIG.ndus</strong> et <strong>CONFIG.jsToken</strong> dans app.js</span>
+    <button onclick="document.getElementById('configBanner').remove()" style="margin-left:auto;background:none;border:1px solid #e8b86d;color:#e8b86d;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:0.7rem">Fermer</button>
+  `;
+  document.body.appendChild(banner);
 }
 
 // =====================================================================
@@ -184,19 +312,13 @@ async function loadMoviesFromSupabase() {
 // =====================================================================
 
 function showSyncBanner(msg) {
-  let banner = document.getElementById('syncBanner');
-  if (!banner) {
-    banner = document.createElement('div');
-    banner.id = 'syncBanner';
-    banner.style.cssText = `
-      position:fixed;top:0;left:0;right:0;z-index:9998;
-      background:linear-gradient(90deg,#1e2535,#0f1219);
-      border-bottom:1px solid #1e2535;
-      padding:8px 48px;font-size:0.7rem;color:#6b7385;
-      display:flex;align-items:center;gap:10px;
-    `;
-    banner.innerHTML = `<span style="display:inline-block;animation:spin 1s linear infinite">⟳</span><span id="syncMsg">${msg}</span>`;
-    document.body.prepend(banner);
+  let b = document.getElementById('syncBanner');
+  if (!b) {
+    b = document.createElement('div');
+    b.id = 'syncBanner';
+    b.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:9998;background:linear-gradient(90deg,#1e2535,#0f1219);border-bottom:1px solid #1e2535;padding:8px 48px;font-size:0.7rem;color:#6b7385;display:flex;align-items:center;gap:10px;`;
+    b.innerHTML = `<span style="display:inline-block;animation:spin 1s linear infinite">⟳</span><span id="syncMsg">${msg}</span>`;
+    document.body.prepend(b);
   } else {
     document.getElementById('syncMsg').textContent = msg;
   }
@@ -233,11 +355,11 @@ function switchTabDirect(name) {
 
 function setupDropzone() {
   const dz = document.getElementById('dropzone');
-  ['dragenter', 'dragover'].forEach(evt =>
-    dz.addEventListener(evt, e => { e.preventDefault(); dz.classList.add('drag'); })
+  ['dragenter', 'dragover'].forEach(e =>
+    dz.addEventListener(e, ev => { ev.preventDefault(); dz.classList.add('drag'); })
   );
-  ['dragleave', 'drop'].forEach(evt =>
-    dz.addEventListener(evt, e => { e.preventDefault(); dz.classList.remove('drag'); })
+  ['dragleave', 'drop'].forEach(e =>
+    dz.addEventListener(e, ev => { ev.preventDefault(); dz.classList.remove('drag'); })
   );
   dz.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
 }
@@ -251,11 +373,9 @@ function handleFiles(files) {
   let added = 0;
   Array.from(files).forEach(file => {
     if (!file.type.startsWith('video/') && !isVideoExtension(file.name)) {
-      showToast('Fichier ignoré : ' + file.name + ' (format non vidéo)', 'error');
-      return;
+      showToast('Fichier ignoré : ' + file.name, 'error'); return;
     }
-    addMovie(file);
-    added++;
+    addMovie(file); added++;
   });
   if (added > 0) switchTabDirect('library');
 }
@@ -265,101 +385,75 @@ function isVideoExtension(name) {
 }
 
 async function addMovie(file) {
-  const id   = 'mv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
-  const ext  = file.name.split('.').pop().toUpperCase();
-  const path = `${id}/${file.name}`;
+  if (!CONFIG.ndus || !CONFIG.jsToken) {
+    showToast('⚠ Configure tes tokens Terabox dans app.js', 'error');
+    return;
+  }
+
+  const id         = 'mv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+  const ext        = file.name.split('.').pop().toUpperCase();
+  const remotePath = `${CONFIG.remoteDir}/${id}_${file.name}`;
 
   const movie = {
-    id, path,
-    name:         file.name,
-    title:        cleanTitle(file.name),
-    size:         file.size,
-    ext,
-    added:        new Date().toLocaleDateString('fr-FR'),
-    storage_path: path,
-    uploading:    true,
+    id, name: file.name, title: cleanTitle(file.name),
+    size: file.size, ext, added: new Date().toLocaleDateString('fr-FR'),
+    terabox_path: remotePath, fs_id: null, uploading: true,
   };
 
   // UI optimiste
   fileStore[id] = URL.createObjectURL(file);
   movies.unshift(movie);
-  renderGrid();
-  updateStats();
+  renderGrid(); updateStats();
 
   try {
-    showToast('⬆ Upload de ' + movie.title + '...', 'info');
-    const card = document.querySelector(`[data-id="${id}"]`);
+    // S'assurer que le dossier existe
+    await tera.ensureDir();
 
-    // Upload fichier → Supabase Storage
-    await uploadWithProgress(file, path, card);
-
-    // Sauvegarde métadonnées → Supabase DB
-    await supa.insert(TABLE, {
-      id,
-      name:         movie.name,
-      title:        movie.title,
-      size:         movie.size,
-      ext:          movie.ext,
-      added:        movie.added,
-      storage_path: path,
+    // Upload vers Terabox avec progression
+    const { fsId } = await tera.upload(file, remotePath, (pct, label) => {
+      const card = document.querySelector(`[data-id="${id}"]`);
+      if (card) updateCardProgress(card, pct, label);
     });
 
-    // Cache local IndexedDB
-    await idbPut({ id, blob: file });
-
+    movie.fs_id    = fsId;
     movie.uploading = false;
+
+    // Sauvegarder en Supabase
+    await supa.insert({
+      id, name: movie.name, title: movie.title,
+      size: movie.size, ext: movie.ext, added: movie.added,
+      terabox_path: remotePath, fs_id: fsId,
+    });
+
+    // Cache local
+    await idbPut(id, file);
+
     renderGrid();
-    showToast('✓ ' + movie.title + ' synchronisé sur tous vos appareils !', 'success');
+    showToast('✓ ' + movie.title + ' uploadé sur Terabox !', 'success');
 
   } catch (e) {
     console.error('Upload error:', e);
     movie.uploading    = false;
-    movie.storage_path = null;
-    localStorage.setItem('macinema_index', JSON.stringify(movies));
+    movie.terabox_path = null;
     renderGrid();
-    showToast('⚠ Upload échoué — sauvegardé localement seulement', 'error');
+    showToast('⚠ Upload échoué : ' + e.message, 'error');
   }
 }
 
-function uploadWithProgress(file, path, card) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', `${SUPABASE_URL}/storage/v1/object/${BUCKET}/${encodeURIComponent(path)}`);
-    xhr.setRequestHeader('apikey', SUPABASE_ANON);
-    xhr.setRequestHeader('Authorization', 'Bearer ' + SUPABASE_ANON);
-    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-    xhr.setRequestHeader('x-upsert', 'true');
-
-    xhr.upload.onprogress = e => {
-      if (e.lengthComputable && card) {
-        const pct = Math.round((e.loaded / e.total) * 100);
-        let bar = card.querySelector('.upload-progress-bar');
-        if (!bar) {
-          bar = document.createElement('div');
-          bar.className = 'upload-progress-bar';
-          bar.innerHTML = `<div class="upload-progress-fill"></div><span class="upload-progress-label">0%</span>`;
-          card.querySelector('.movie-thumb').appendChild(bar);
-        }
-        bar.querySelector('.upload-progress-fill').style.width = pct + '%';
-        bar.querySelector('.upload-progress-label').textContent = pct + '%';
-      }
-    };
-
-    xhr.onload  = () => {
-      if (xhr.status < 300) { resolve(); }
-      else { reject(new Error(`Supabase Storage error ${xhr.status}: ${xhr.responseText}`)); }
-    };
-    xhr.onerror = () => reject(new Error('Erreur réseau'));
-    xhr.send(file);
-  });
+function updateCardProgress(card, pct, label) {
+  let bar = card.querySelector('.upload-progress-bar');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.className = 'upload-progress-bar';
+    bar.innerHTML = `<div class="upload-progress-fill"></div><span class="upload-progress-label"></span>`;
+    card.querySelector('.movie-thumb').appendChild(bar);
+  }
+  bar.querySelector('.upload-progress-fill').style.width = pct + '%';
+  bar.querySelector('.upload-progress-label').textContent = label;
 }
 
 function cleanTitle(filename) {
-  return filename
-    .replace(/\.[^.]+$/, '')
-    .replace(/[._\-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return filename.replace(/\.[^.]+$/, '').replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 // =====================================================================
@@ -374,8 +468,7 @@ function formatSize(bytes) {
 
 function updateStats() {
   document.getElementById('stat-count').textContent = movies.length;
-  const totalBytes = movies.reduce((sum, m) => sum + (m.size || 0), 0);
-  document.getElementById('stat-size').textContent = formatSize(totalBytes);
+  document.getElementById('stat-size').textContent  = formatSize(movies.reduce((s, m) => s + (m.size || 0), 0));
 }
 
 // =====================================================================
@@ -387,20 +480,15 @@ function renderGrid(filter = '') {
   const empty = document.getElementById('emptyState');
   const label = document.getElementById('film-count-label');
 
-  const visible = filter
-    ? movies.filter(m => m.title.toLowerCase().includes(filter.toLowerCase()))
-    : movies;
-
+  const visible = filter ? movies.filter(m => m.title.toLowerCase().includes(filter.toLowerCase())) : movies;
   label.textContent = movies.length ? `(${movies.length})` : '';
 
   if (!movies.length) {
     grid.style.display  = 'none';
     empty.style.display = 'block';
-    empty.innerHTML = `
-      <div class="big-icon">🎞</div>
-      <h3>Votre collection est vide</h3>
+    empty.innerHTML = `<div class="big-icon">🎞</div><h3>Votre collection est vide</h3>
       <p>Ajoutez vos films via l'onglet <strong class="accent">Ajouter</strong><br>
-      Ils seront synchronisés automatiquement sur tous vos appareils.</p>`;
+      Stockage Terabox — 1 TB gratuit</p>`;
     return;
   }
 
@@ -418,55 +506,59 @@ function renderGrid(filter = '') {
 
 function buildMovieCard(m) {
   const available = !!fileStore[m.id];
-  const previewSrc = available && !m.uploading ? `src="${fileStore[m.id]}"` : '';
-  const thumbOpacity = available && !m.uploading ? '0' : '0.3';
-
   const badge = m.uploading
-    ? `<div class="sync-badge uploading" title="Upload en cours...">⬆ Upload...</div>`
-    : m.storage_path
-      ? `<div class="sync-badge" title="Synchronisé sur Supabase">☁ Sync</div>`
-      : `<div class="offline-badge" title="Local uniquement">⚠ Local</div>`;
+    ? `<div class="sync-badge uploading">⬆ Upload...</div>`
+    : m.terabox_path
+      ? `<div class="sync-badge">☁ Terabox</div>`
+      : `<div class="offline-badge">⚠ Local</div>`;
 
   return `
     <div class="movie-card" data-id="${m.id}">
       <div class="movie-thumb">
         ${available && !m.uploading
-          ? `<video ${previewSrc} preload="metadata" muted crossorigin="anonymous"
-               style="width:100%;height:100%;object-fit:cover;position:absolute;inset:0"></video>`
-          : ''}
-        <div style="position:relative;z-index:1;font-size:2.5rem;opacity:${thumbOpacity}">🎬</div>
+          ? `<video src="${fileStore[m.id]}" preload="metadata" muted
+               style="width:100%;height:100%;object-fit:cover;position:absolute;inset:0"></video>` : ''}
+        <div style="position:relative;z-index:1;font-size:2.5rem;opacity:${available && !m.uploading ? 0 : 0.3}">🎬</div>
         <div class="play-overlay" onclick="openPlayer('${m.id}')">▶</div>
         <div class="movie-format">${m.ext}</div>
         ${badge}
       </div>
       <div class="movie-info">
         <h3 title="${m.title}">${m.title}</h3>
-        <div class="meta">
-          <span>${formatSize(m.size)}</span>
-          <span>${m.added}</span>
-        </div>
+        <div class="meta"><span>${formatSize(m.size)}</span><span>${m.added}</span></div>
       </div>
       <div class="movie-actions">
-        <button class="btn btn-primary"   onclick="openPlayer('${m.id}')"  ${!available || m.uploading ? 'disabled' : ''}>▶ Lire</button>
-        <button class="btn btn-secondary" onclick="downloadById('${m.id}')" ${!available || m.uploading ? 'disabled' : ''}>⬇</button>
+        <button class="btn btn-primary"   onclick="openPlayer('${m.id}')"   ${m.uploading ? 'disabled' : ''}>▶ Lire</button>
+        <button class="btn btn-secondary" onclick="downloadById('${m.id}')" ${m.uploading ? 'disabled' : ''}>⬇</button>
         <button class="btn btn-danger"    onclick="deleteMovie('${m.id}')"  ${m.uploading ? 'disabled' : ''}>🗑</button>
       </div>
     </div>`;
 }
 
-function filterMovies(value) {
-  renderGrid(value);
-}
+function filterMovies(value) { renderGrid(value); }
 
 // =====================================================================
 // Player
 // =====================================================================
 
-function openPlayer(id) {
+async function openPlayer(id) {
   const movie = movies.find(m => m.id === id);
   if (!movie) return;
-  const url = fileStore[id];
-  if (!url) { showToast('Fichier non disponible.', 'error'); return; }
+
+  // Chercher l'URL : cache local d'abord, sinon récupérer depuis Terabox
+  let url = fileStore[id];
+
+  if (!url) {
+    if (!movie.fs_id) { showToast('Fichier non disponible', 'error'); return; }
+    showToast('⏳ Récupération du lien de lecture...', 'info');
+    try {
+      url = await tera.getDlink(movie.fs_id);
+      fileStore[id] = url;
+    } catch (e) {
+      showToast('⚠ Impossible de lire le film : ' + e.message, 'error');
+      return;
+    }
+  }
 
   currentMovie = { ...movie, url };
   document.getElementById('modalTitle').textContent  = movie.title;
@@ -475,9 +567,10 @@ function openPlayer(id) {
   document.getElementById('meta-format').textContent = movie.ext;
 
   const player = document.getElementById('mainPlayer');
+  player.removeAttribute('crossorigin');
   player.src = url;
-  player.crossOrigin = 'anonymous';
-  player.play();
+  player.load();
+  player.play().catch(() => {});
 
   resetConvertUI();
   document.getElementById('playerModal').classList.add('open');
@@ -485,13 +578,12 @@ function openPlayer(id) {
 
 function closeModal() {
   const player = document.getElementById('mainPlayer');
-  player.pause();
-  player.src = '';
+  player.pause(); player.src = '';
   document.getElementById('playerModal').classList.remove('open');
   currentMovie = null;
 }
 
-document.getElementById('playerModal').addEventListener('click', function (e) {
+document.getElementById('playerModal').addEventListener('click', function(e) {
   if (e.target === this) closeModal();
 });
 
@@ -504,18 +596,20 @@ function downloadCurrentMovie() {
   triggerDownload(currentMovie.url, currentMovie.name);
 }
 
-function downloadById(id) {
+async function downloadById(id) {
   const m   = movies.find(x => x.id === id);
-  const url = fileStore[id];
-  if (!m || !url) return;
-  triggerDownload(url, m.name);
+  let   url = fileStore[id];
+  if (!url && m?.fs_id) {
+    showToast('⏳ Génération du lien...', 'info');
+    url = await tera.getDlink(m.fs_id);
+    fileStore[id] = url;
+  }
+  if (url) triggerDownload(url, m.name);
 }
 
 function triggerDownload(url, filename) {
-  const a    = document.createElement('a');
-  a.href     = url;
-  a.download = filename;
-  a.click();
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
 }
 
 // =====================================================================
@@ -524,35 +618,29 @@ function triggerDownload(url, filename) {
 
 async function deleteMovie(id) {
   const m = movies.find(x => x.id === id);
-  if (!m) return;
-  if (!confirm(`Supprimer "${m.title}" de votre collection ?`)) return;
+  if (!m || !confirm(`Supprimer "${m.title}" ?`)) return;
 
-  if (fileStore[id] && !fileStore[id].startsWith('http')) {
-    URL.revokeObjectURL(fileStore[id]);
-  }
+  if (fileStore[id] && !fileStore[id].startsWith('http')) URL.revokeObjectURL(fileStore[id]);
   delete fileStore[id];
   movies = movies.filter(x => x.id !== id);
-  renderGrid();
-  updateStats();
+  renderGrid(); updateStats();
 
   try {
-    await supa.delete(TABLE, `id=eq.${id}`);
-    if (m.storage_path) await supa.deleteFile(m.storage_path);
+    await supa.delete(id);
+    if (m.terabox_path) await tera.deleteFile(m.terabox_path);
     await idbDelete(id);
-    showToast('Film supprimé de Supabase', 'info');
+    showToast('Film supprimé', 'info');
   } catch (e) {
-    console.error('Delete error:', e);
-    showToast('Film supprimé localement (erreur Supabase)', 'error');
+    showToast('Suppression partielle : ' + e.message, 'error');
   }
 }
 
 // =====================================================================
-// Convert to MP4 — FFmpeg.wasm (AVI, MKV, MOV, WMV, etc.)
+// Convert to MP4 — FFmpeg.wasm
 // =====================================================================
 
 let ffmpegInstance = null;
 
-/** Charge FFmpeg.wasm depuis CDN (une seule fois) */
 async function loadFFmpeg() {
   if (ffmpegInstance) return ffmpegInstance;
 
@@ -564,50 +652,40 @@ async function loadFFmpeg() {
 
   const ff = new FFmpeg();
 
-  // Progression globale 0→1 fournie par FFmpeg.wasm
   ff.on('progress', ({ progress }) => {
     const pct     = Math.min(99, Math.round(progress * 100));
     const elapsed = (performance.now() - convertStats.startTime) / 1000;
     setProgress(pct, `Conversion : ${pct}%`);
     document.getElementById('stat-elapsed').textContent = formatDuration(elapsed);
     if (pct > 1) {
-      const remaining = (elapsed / pct) * (100 - pct);
-      document.getElementById('stat-remaining').textContent = formatDuration(remaining);
+      document.getElementById('stat-remaining').textContent =
+        formatDuration((elapsed / pct) * (100 - pct));
     }
   });
 
-  // Logs FFmpeg ligne par ligne :
-  // frame=  240 fps= 48 q=23.0 size=    3072kB time=00:00:10.01 bitrate=2514.5kbits/s speed=2.01x
   ff.on('log', ({ message }) => {
-    // FPS d'encodage
-    const fpsM = message.match(/fps=\s*([\d.]+)/);
+    const fpsM  = message.match(/fps=\s*([\d.]+)/);
     if (fpsM && parseFloat(fpsM[1]) > 0)
       document.getElementById('stat-fps').textContent = parseFloat(fpsM[1]).toFixed(0) + ' fps';
 
-    // Taille générée (kB → bytes)
     const sizeM = message.match(/size=\s*([\d.]+)\s*[kK][bB]/);
     if (sizeM) {
       const bytes = parseFloat(sizeM[1]) * 1024;
       const now   = performance.now();
       const dt    = (now - convertStats.lastByteTime) / 1000;
-
-      // MB/s = delta taille / delta temps
       if (dt >= 0.3 && bytes > convertStats.lastBytes) {
-        const mbps = (bytes - convertStats.lastBytes) / dt / 1048576;
-        document.getElementById('stat-speed').textContent = mbps.toFixed(2) + ' MB/s';
+        document.getElementById('stat-speed').textContent =
+          ((bytes - convertStats.lastBytes) / dt / 1048576).toFixed(2) + ' MB/s';
         convertStats.lastBytes    = bytes;
         convertStats.lastByteTime = now;
-      } else if (convertStats.lastBytes === 0) {
-        convertStats.lastBytes    = bytes;
-        convertStats.lastByteTime = now;
+      } else if (!convertStats.lastBytes) {
+        convertStats.lastBytes = bytes; convertStats.lastByteTime = now;
       }
-
       convertStats.bytesWritten = bytes;
       document.getElementById('stat-written').textContent = formatSize(bytes);
     }
   });
 
-  // Charger les wasm core depuis CDN
   const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
   await ff.load({
     coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`,   'text/javascript'),
@@ -625,10 +703,8 @@ function resetConvertUI() {
   document.getElementById('progressPct').textContent       = '0%';
   document.getElementById('progressLabel').textContent     = 'Traitement...';
   const btn = document.getElementById('convertBtn');
-  btn.disabled    = false;
-  btn.textContent = 'Convertir en MP4';
-  stopStatsTimer();
-  resetStatsDisplay();
+  btn.disabled = false; btn.textContent = 'Convertir en MP4';
+  stopStatsTimer(); resetStatsDisplay();
 }
 
 function stopStatsTimer() {
@@ -636,11 +712,10 @@ function stopStatsTimer() {
 }
 
 function resetStatsDisplay() {
-  document.getElementById('stat-elapsed').textContent   = '0:00';
-  document.getElementById('stat-remaining').textContent = '—';
-  document.getElementById('stat-speed').textContent     = '— MB/s';
-  document.getElementById('stat-fps').textContent       = '— fps';
-  document.getElementById('stat-written').textContent   = '0 MB';
+  ['stat-elapsed','stat-remaining','stat-speed','stat-fps','stat-written'].forEach(id => {
+    document.getElementById(id).textContent = id === 'stat-elapsed' ? '0:00' :
+      id === 'stat-written' ? '0 MB' : '—';
+  });
   document.querySelectorAll('.stat-box').forEach(b => b.classList.remove('active'));
 }
 
@@ -649,13 +724,10 @@ function startStatsTimer() {
   convertStats.lastByteTime = performance.now();
   convertStats.lastBytes    = 0;
   convertStats.bytesWritten = 0;
-  convertStats.frameCount   = 0;
   document.querySelectorAll('.stat-box').forEach(b => b.classList.add('active'));
-  // Le timer met juste à jour le temps écoulé chaque seconde
-  // Les autres stats (MB/s, taille, fps) sont mises à jour en temps réel par les logs FFmpeg
   convertStats.timerInterval = setInterval(() => {
-    const elapsed = (performance.now() - convertStats.startTime) / 1000;
-    document.getElementById('stat-elapsed').textContent = formatDuration(elapsed);
+    document.getElementById('stat-elapsed').textContent =
+      formatDuration((performance.now() - convertStats.startTime) / 1000);
   }, 1000);
 }
 
@@ -669,96 +741,68 @@ async function convertCurrentMovie() {
   btn.disabled = true; btn.textContent = 'Chargement FFmpeg...';
   document.getElementById('convertProgress').style.display = 'block';
   document.getElementById('convertResult').style.display   = 'none';
-
-  try {
-    await runFFmpegConversion();
-  } catch (err) {
-    handleConversionError(err);
-  }
+  try { await runFFmpegConversion(); } catch (err) { handleConversionError(err); }
 }
 
 async function runFFmpegConversion() {
   const btn = document.getElementById('convertBtn');
   btn.textContent = 'Conversion...';
-
-  // Qualité → CRF FFmpeg (plus bas = meilleure qualité)
-  const crf = { high: '18', medium: '23', low: '28' };
+  const crf     = { high: '18', medium: '23', low: '28' };
   const quality = document.getElementById('qualitySelect').value;
-
-  // Charger FFmpeg
-  const { ff, fetchFile } = await loadFFmpeg();
+  const { ff }  = await loadFFmpeg();
 
   startStatsTimer();
   setProgress(1, 'Lecture du fichier source...');
 
-  // Récupérer le blob source
   let sourceData;
   const url = currentMovie.url;
   if (url.startsWith('blob:')) {
     const cached = await idbGet(currentMovie.id);
-    if (cached && cached.blob) {
-      sourceData = await cached.blob.arrayBuffer();
-    } else {
-      const res  = await fetch(url);
-      sourceData = await res.arrayBuffer();
-    }
+    sourceData = cached?.blob
+      ? await cached.blob.arrayBuffer()
+      : await (await fetch(url)).arrayBuffer();
   } else {
-    // URL Supabase — fetch direct
-    showToast('⬇ Téléchargement depuis Supabase...', 'info');
-    const res  = await fetch(url);
-    sourceData = await res.arrayBuffer();
+    showToast('⬇ Téléchargement depuis Terabox...', 'info');
+    sourceData = await (await fetch(url)).arrayBuffer();
   }
 
-  const ext    = currentMovie.ext.toLowerCase();
-  const inFile = `input.${ext}`;
+  const ext     = currentMovie.ext.toLowerCase();
+  const inFile  = `input.${ext}`;
   const outFile = 'output.mp4';
 
   setProgress(3, 'Écriture dans FFmpeg...');
   await ff.writeFile(inFile, new Uint8Array(sourceData));
-
   setProgress(5, 'Conversion en cours...');
   btn.textContent = 'Conversion...';
 
-  // Commande FFmpeg : re-encode en H.264 / AAC, compatible partout
   await ff.exec([
-    '-i', inFile,
-    '-c:v', 'libx264',
-    '-crf', crf[quality] || '23',
-    '-preset', 'fast',
-    '-c:a', 'aac',
-    '-b:a', '192k',
-    '-movflags', '+faststart',
-    '-y',
-    outFile,
+    '-i', inFile, '-c:v', 'libx264',
+    '-crf', crf[quality] || '23', '-preset', 'fast',
+    '-c:a', 'aac', '-b:a', '192k',
+    '-movflags', '+faststart', '-y', outFile,
   ]);
 
   setProgress(98, 'Finalisation...');
-
-  // Lire le résultat
   const data    = await ff.readFile(outFile);
   const blob    = new Blob([data.buffer], { type: 'video/mp4' });
   const blobUrl = URL.createObjectURL(blob);
   const outName = currentMovie.title + '_converti.mp4';
 
-  // Nettoyage mémoire FFmpeg
   try { await ff.deleteFile(inFile);  } catch {}
   try { await ff.deleteFile(outFile); } catch {}
 
   stopStatsTimer();
   setProgress(100, 'Conversion terminée !');
-
-  const totalElapsed = (performance.now() - convertStats.startTime) / 1000;
-  document.getElementById('stat-elapsed').textContent   = formatDuration(totalElapsed);
+  document.getElementById('stat-elapsed').textContent   = formatDuration((performance.now() - convertStats.startTime) / 1000);
   document.getElementById('stat-remaining').textContent = '0:00';
-  document.getElementById('stat-written').textContent   = formatSize(blob.size);  // taille réelle finale
+  document.getElementById('stat-written').textContent   = formatSize(blob.size);
   document.getElementById('stat-speed').textContent     = '—';
   document.getElementById('stat-fps').textContent       = '—';
 
   window._lastConvertedBlob = blob;
   showConvertSuccess(blobUrl, outName, blob.size);
   showToast('✓ Conversion réussie !', 'success');
-  btn.textContent = 'Reconvertir';
-  btn.disabled    = false;
+  btn.textContent = 'Reconvertir'; btn.disabled = false;
 }
 
 function setProgress(pct, label) {
@@ -775,13 +819,12 @@ function showConvertSuccess(url, name, size) {
       <span class="result-icon">✓</span>
       <span class="result-text">Conversion terminée — <strong>${name}</strong> (${formatSize(size)})</span>
       <button class="btn btn-primary"   onclick="triggerDownload('${url}','${name}')">⬇ Télécharger</button>
-      <button class="btn btn-secondary" onclick="addConverted('${url}','${name}',${size})">☁ Ajouter & synchroniser</button>
+      <button class="btn btn-secondary" onclick="addConverted('${url}','${name}',${size})">☁ Ajouter & uploader</button>
     </div>`;
 }
 
 function handleConversionError(err) {
   stopStatsTimer();
-  console.error('[FFmpeg]', err);
   showToast('Erreur : ' + err.message, 'error');
   const btn = document.getElementById('convertBtn');
   btn.textContent = 'Convertir en MP4'; btn.disabled = false;
@@ -789,22 +832,19 @@ function handleConversionError(err) {
   div.style.display = 'block';
   div.innerHTML = `
     <div class="result-warning">
-      ⚠ Erreur de conversion : <em>${err.message}</em><br><br>
-      Si le problème persiste, téléchargez le fichier et utilisez
-      <a href="https://www.handbrake.fr" target="_blank">HandBrake</a> (gratuit).<br><br>
+      ⚠ Erreur : <em>${err.message}</em><br><br>
       <button class="btn btn-secondary" onclick="downloadCurrentMovie()" style="width:auto">⬇ Télécharger l'original</button>
     </div>`;
 }
 
 async function addConverted(url, name, size) {
   const blob = window._lastConvertedBlob;
-  if (!blob) { showToast('⚠ Fichier converti introuvable', 'error'); return; }
-  const file = new File([blob], name, { type: blob.type });
-  await addMovie(file);
+  if (!blob) { showToast('⚠ Fichier introuvable', 'error'); return; }
+  await addMovie(new File([blob], name, { type: blob.type }));
 }
 
 // =====================================================================
-// Toast Notifications
+// Toast
 // =====================================================================
 
 function showToast(message, type = 'info') {
@@ -812,7 +852,7 @@ function showToast(message, type = 'info') {
   const container = document.getElementById('toastContainer');
   const toast     = document.createElement('div');
   toast.className = `toast ${type}`;
-  toast.innerHTML = `<span>${icons[type] || 'ℹ️'}</span><span>${message}</span>`;
+  toast.innerHTML = `<span>${icons[type]}</span><span>${message}</span>`;
   container.appendChild(toast);
   setTimeout(() => toast.remove(), 4000);
 }
