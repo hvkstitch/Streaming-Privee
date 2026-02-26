@@ -851,3 +851,19 @@ function showToast(message, type = 'info') {
   container.appendChild(toast);
   setTimeout(() => toast.remove(), 4000);
 }
+
+// =====================================================================
+// Exposition globale — nécessaire car app.js est chargé en type="module"
+// Les fonctions de module ne sont pas accessibles depuis les onclick HTML
+// =====================================================================
+window.switchTab            = switchTab;
+window.handleFiles          = handleFiles;
+window.filterMovies         = filterMovies;
+window.openPlayer           = openPlayer;
+window.closeModal           = closeModal;
+window.downloadCurrentMovie = downloadCurrentMovie;
+window.downloadById         = downloadById;
+window.triggerDownload      = triggerDownload;
+window.deleteMovie          = deleteMovie;
+window.convertCurrentMovie  = convertCurrentMovie;
+window.addConverted         = addConverted;
