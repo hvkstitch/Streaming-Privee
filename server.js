@@ -13,13 +13,17 @@ app.use((req, res, next) => {
   if (req.path === '/terabox/upload') return next();
   express.json()(req, res, next);
 });
-app.use(express.urlencoded({ extended: true, limit: '50gb' }));
-
-// CORS — autoriser tous les origines
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin',  '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, X-Ndus, X-JsToken, X-AppId, X-BrowserId, X-UploadId');
+  if (req.path === '/terabox/upload') return next();
+  express.urlencoded({ extended: true })(req, res, next);
+});
+
+// CORS + CORP — nécessaire car la page tourne avec COEP:require-corp (Service Worker FFmpeg)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin',   '*');
+  res.header('Access-Control-Allow-Methods',  'GET, POST, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers',  'Content-Type, X-Ndus, X-JsToken, X-AppId, X-BrowserId, X-UploadId');
+  res.header('Cross-Origin-Resource-Policy',  'cross-origin');  // ← requis par COEP du SW
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -35,8 +39,9 @@ function teraboxHeaders(ndus, browserId) {
   };
 }
 
-// Fetch avec timeout configurable
+// Fetch avec timeout configurable (0 = pas de timeout)
 function fetchWithTimeout(url, opts = {}, ms = 60000) {
+  if (!ms) return fetch(url, opts);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   return fetch(url, { ...opts, signal: controller.signal })
@@ -60,8 +65,11 @@ app.post('/terabox/precreate', async (req, res) => {
       `https://www.terabox.com/api/precreate?${params}`,
       { method: 'POST', headers: { ...teraboxHeaders(ndus, browserId), 'Content-Type': 'application/x-www-form-urlencoded' }, body }
     );
-    res.json(await r.json());
+    const text = await r.text();
+    console.log(`[precreate] status=${r.status} body=${text.slice(0,300)}`);
+    try { res.json(JSON.parse(text)); } catch { res.status(502).json({ error: 'Réponse non-JSON', raw: text.slice(0,500) }); }
   } catch (e) {
+    console.error('[precreate] error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -70,9 +78,15 @@ app.post('/terabox/precreate', async (req, res) => {
 // POST /terabox/upload — reçoit le chunk en base64
 app.post('/terabox/upload', express.json({ limit: '50gb' }), async (req, res) => {
   const { ndus, jsToken, appId, browserId, uploadId, path, partseq, chunkBase64, md5 } = req.body;
+
+  // Validation rapide
+  if (!chunkBase64) return res.status(400).json({ error: 'chunkBase64 manquant — body mal parsé ou requête tronquée' });
+  if (!uploadId)    return res.status(400).json({ error: 'uploadId manquant' });
+
   try {
     // Décoder le chunk base64
     const chunkBuffer = Buffer.from(chunkBase64, 'base64');
+    console.log(`[upload] partseq=${partseq} chunkSize=${chunkBuffer.length} bytes uploadId=${uploadId}`);
 
     // Construire le FormData manuellement
     const boundary = '----TeraboxBoundary' + Date.now();
@@ -96,13 +110,22 @@ app.post('/terabox/upload', express.json({ limit: '50gb' }), async (req, res) =>
         headers: {
           ...teraboxHeaders(ndus, browserId),
           'Content-Type': `multipart/form-data; boundary=${boundary}`,
-          'Content-Length': body.length,
+          'Content-Length': String(body.length),
         },
         body,
-      }
+      },
+      0  // pas de timeout — durée variable selon taille du chunk
     );
-    res.json(await r.json());
+
+    const text = await r.text();
+    console.log(`[upload] Terabox response status=${r.status} body=${text.slice(0, 200)}`);
+    try {
+      res.json(JSON.parse(text));
+    } catch {
+      res.status(502).json({ error: 'Réponse non-JSON de Terabox', raw: text.slice(0, 500) });
+    }
   } catch (e) {
+    console.error('[upload] error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
