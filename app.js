@@ -16,14 +16,13 @@ const CONFIG = {
   jsToken:   'F3063036A4C7F1EE34E88C07B08833D5B639780B6BFE6218F4B06AEA5AE18C1CF688DF889BB329F8A87FD1E9DCE6EB20CFE668561963F1AF613B63F0336E6E6F',
   appId:     '250528',
   browserId: 'AD8vpD6GQgZiKgIIySDIDz_V__gdukEtZdGa6e8ULxWitqfiPI2dDHeAsME=',
-  uploadId:  '',
   remoteDir: '/MaCinematheque',
   supabaseUrl:  'https://olhfduqnxhaoaxcxjxxi.supabase.co',
   supabaseAnon: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9saGZkdXFueGhhb2F4Y3hqeHhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIxMDI3NTgsImV4cCI6MjA4NzY3ODc1OH0.gJokdFbBt5k9DuHBkMRtxhHcNQNJlyOjXnXMNu-Q-1k',
 };
 
-// Taille de chaque chunk d'upload : 20 MB
-const CHUNK_SIZE = 20 * 1024 * 1024;
+// Taille de chaque chunk d'upload : 500 MB (pas de limite pratique)
+const CHUNK_SIZE = 500 * 1024 * 1024;
 
 // =====================================================================
 // Supabase helpers
@@ -68,7 +67,6 @@ const tera = {
       jsToken:   CONFIG.jsToken,
       appId:     CONFIG.appId,
       browserId: CONFIG.browserId,
-      uploadId:  CONFIG.uploadId,
     };
   },
 
@@ -89,12 +87,56 @@ const tera = {
     return r.json();
   },
 
-  /** Calcule le MD5 d'un ArrayBuffer */
+  /** Calcule le vrai MD5 d'un ArrayBuffer (requis par l'API Terabox) */
   async md5(buffer) {
-    const hash = await crypto.subtle.digest('SHA-256', buffer);
-    // Terabox accepte SHA-256 comme "md5" pour les blocs
-    return Array.from(new Uint8Array(hash))
-      .map(b => b.toString(16).padStart(2, '0')).join('');
+    // crypto.subtle ne supporte pas MD5 (obsolète) — implémentation JS pure
+    function md5js(buf) {
+      const b = new Uint8Array(buf);
+      function safeAdd(x, y) { const l = (x & 0xffff) + (y & 0xffff); return (((x >> 16) + (y >> 16) + (l >> 16)) << 16) | (l & 0xffff); }
+      function rol(n, c) { return (n << c) | (n >>> (32 - c)); }
+      function cmn(q, a, b, x, s, t) { return safeAdd(rol(safeAdd(safeAdd(a, q), safeAdd(x, t)), s), b); }
+      function ff(a,b,c,d,x,s,t){ return cmn((b&c)|((~b)&d),a,b,x,s,t); }
+      function gg(a,b,c,d,x,s,t){ return cmn((b&d)|(c&(~d)),a,b,x,s,t); }
+      function hh(a,b,c,d,x,s,t){ return cmn(b^c^d,a,b,x,s,t); }
+      function ii(a,b,c,d,x,s,t){ return cmn(c^(b|(~d)),a,b,x,s,t); }
+      const orig = b.length;
+      const len  = orig + 1;
+      const extra = (len % 64 < 56 ? 56 - len % 64 : 120 - len % 64);
+      const padded = new Uint8Array(len + extra + 8);
+      padded.set(b); padded[orig] = 0x80;
+      const bits = orig * 8;
+      padded[len + extra]     = bits & 0xff;
+      padded[len + extra + 1] = (bits >>> 8)  & 0xff;
+      padded[len + extra + 2] = (bits >>> 16) & 0xff;
+      padded[len + extra + 3] = (bits >>> 24) & 0xff;
+      const words = new Int32Array(padded.buffer);
+      let a = 0x67452301, bv = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
+      for (let i = 0; i < words.length; i += 16) {
+        const [oa,ob,oc,od] = [a,bv,c,d];
+        a=ff(a,bv,c,d,words[i+0],7,-680876936);d=ff(d,a,bv,c,words[i+1],12,-389564586);c=ff(c,d,a,bv,words[i+2],17,606105819);bv=ff(bv,c,d,a,words[i+3],22,-1044525330);
+        a=ff(a,bv,c,d,words[i+4],7,-176418897);d=ff(d,a,bv,c,words[i+5],12,1200080426);c=ff(c,d,a,bv,words[i+6],17,-1473231341);bv=ff(bv,c,d,a,words[i+7],22,-45705983);
+        a=ff(a,bv,c,d,words[i+8],7,1770035416);d=ff(d,a,bv,c,words[i+9],12,-1958414417);c=ff(c,d,a,bv,words[i+10],17,-42063);bv=ff(bv,c,d,a,words[i+11],22,-1990404162);
+        a=ff(a,bv,c,d,words[i+12],7,1804603682);d=ff(d,a,bv,c,words[i+13],12,-40341101);c=ff(c,d,a,bv,words[i+14],17,-1502002290);bv=ff(bv,c,d,a,words[i+15],22,1236535329);
+        a=gg(a,bv,c,d,words[i+1],5,-165796510);d=gg(d,a,bv,c,words[i+6],9,-1069501632);c=gg(c,d,a,bv,words[i+11],14,643717713);bv=gg(bv,c,d,a,words[i+0],20,-373897302);
+        a=gg(a,bv,c,d,words[i+5],5,-701558691);d=gg(d,a,bv,c,words[i+10],9,38016083);c=gg(c,d,a,bv,words[i+15],14,-660478335);bv=gg(bv,c,d,a,words[i+4],20,-405537848);
+        a=gg(a,bv,c,d,words[i+9],5,568446438);d=gg(d,a,bv,c,words[i+14],9,-1019803690);c=gg(c,d,a,bv,words[i+3],14,-187363961);bv=gg(bv,c,d,a,words[i+8],20,1163531501);
+        a=gg(a,bv,c,d,words[i+13],5,-1444681467);d=gg(d,a,bv,c,words[i+2],9,-51403784);c=gg(c,d,a,bv,words[i+7],14,1735328473);bv=gg(bv,c,d,a,words[i+12],20,-1926607734);
+        a=hh(a,bv,c,d,words[i+5],4,-378558);d=hh(d,a,bv,c,words[i+8],11,-2022574463);c=hh(c,d,a,bv,words[i+11],16,1839030562);bv=hh(bv,c,d,a,words[i+14],23,-35309556);
+        a=hh(a,bv,c,d,words[i+1],4,-1530992060);d=hh(d,a,bv,c,words[i+4],11,1272893353);c=hh(c,d,a,bv,words[i+7],16,-155497632);bv=hh(bv,c,d,a,words[i+10],23,-1094730640);
+        a=hh(a,bv,c,d,words[i+13],4,681279174);d=hh(d,a,bv,c,words[i+0],11,-358537222);c=hh(c,d,a,bv,words[i+3],16,-722521979);bv=hh(bv,c,d,a,words[i+6],23,76029189);
+        a=hh(a,bv,c,d,words[i+9],4,-640364487);d=hh(d,a,bv,c,words[i+12],11,-421815835);c=hh(c,d,a,bv,words[i+15],16,530742520);bv=hh(bv,c,d,a,words[i+2],23,-995338651);
+        a=ii(a,bv,c,d,words[i+0],6,-198630844);d=ii(d,a,bv,c,words[i+7],10,1126891415);c=ii(c,d,a,bv,words[i+14],15,-1416354905);bv=ii(bv,c,d,a,words[i+5],21,-57434055);
+        a=ii(a,bv,c,d,words[i+12],6,1700485571);d=ii(d,a,bv,c,words[i+3],10,-1894986606);c=ii(c,d,a,bv,words[i+10],15,-1051523);bv=ii(bv,c,d,a,words[i+1],21,-2054922799);
+        a=ii(a,bv,c,d,words[i+8],6,1873313359);d=ii(d,a,bv,c,words[i+15],10,-30611744);c=ii(c,d,a,bv,words[i+6],15,-1560198380);bv=ii(bv,c,d,a,words[i+13],21,1309151649);
+        a=ii(a,bv,c,d,words[i+4],6,-145523070);d=ii(d,a,bv,c,words[i+11],10,-1120210379);c=ii(c,d,a,bv,words[i+2],15,718787259);bv=ii(bv,c,d,a,words[i+9],21,-343485551);
+        a=safeAdd(a,oa);bv=safeAdd(bv,ob);c=safeAdd(c,oc);d=safeAdd(d,od);
+      }
+      const out = new Uint8Array(16);
+      new DataView(out.buffer).setInt32(0,a,true); new DataView(out.buffer).setInt32(4,bv,true);
+      new DataView(out.buffer).setInt32(8,c,true); new DataView(out.buffer).setInt32(12,d,true);
+      return out;
+    }
+    return Array.from(md5js(buffer)).map(b => b.toString(16).padStart(2,'0')).join('');
   },
 
   /** Upload complet d'un fichier vers Terabox (multipart) */
@@ -122,11 +164,14 @@ const tera = {
       const md5    = await this.md5(buffer);
       blockList.push(md5);
 
-      // Encoder le chunk en base64 pour l'envoyer au proxy
-      // ⚠ Ne pas utiliser spread (...) sur un grand Uint8Array → stack overflow
+      // Encoder le chunk en base64 — traitement par sous-blocs de 8 KB
+      // (évite le stack overflow du spread ET le freeze O(n²) de la boucle +=)
       const bytes = new Uint8Array(buffer);
       let binary = '';
-      for (let j = 0; j < bytes.length; j++) binary += String.fromCharCode(bytes[j]);
+      const BTOA_CHUNK = 8192;
+      for (let j = 0; j < bytes.length; j += BTOA_CHUNK) {
+        binary += String.fromCharCode(...bytes.subarray(j, Math.min(j + BTOA_CHUNK, bytes.length)));
+      }
       const base64 = btoa(binary);
 
       const pct = Math.round(((i + 1) / totalChunks) * 85);
@@ -365,18 +410,12 @@ function setupDropzone() {
 
 function handleFiles(files) {
   if (!files.length) return;
-  let added = 0;
-  Array.from(files).forEach(file => {
-    if (!file.type.startsWith('video/') && !isVideoExtension(file.name)) {
-      showToast('Fichier ignoré : ' + file.name, 'error'); return;
-    }
-    addMovie(file); added++;
-  });
-  if (added > 0) switchTabDirect('library');
+  Array.from(files).forEach(file => addMovie(file));
+  switchTabDirect('library');
 }
 
 function isVideoExtension(name) {
-  return /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mpg|mpeg)$/i.test(name);
+  return true; // aucune restriction
 }
 
 async function addMovie(file) {
@@ -540,17 +579,21 @@ async function openPlayer(id) {
   const movie = movies.find(m => m.id === id);
   if (!movie) return;
 
-  // Chercher l'URL : cache local d'abord, sinon récupérer depuis Terabox
   let url = fileStore[id];
 
-  if (!url) {
-    if (!movie.fs_id) { showToast('Fichier non disponible', 'error'); return; }
-    showToast('⏳ Récupération du lien de lecture...', 'info');
-    try {
-      url = await tera.getDlink(movie.fs_id);
-      fileStore[id] = url;
-    } catch (e) {
-      showToast('⚠ Impossible de lire le film : ' + e.message, 'error');
+  // Si pas de URL locale (blob), récupérer le dlink Terabox
+  if (!url || url.startsWith('http')) {
+    if (movie.fs_id) {
+      showToast('⏳ Récupération du lien de lecture...', 'info');
+      try {
+        url = await tera.getDlink(movie.fs_id);
+        fileStore[id] = url; // mis en cache (expire après ~8h, raisonnablement ok)
+      } catch (e) {
+        showToast('⚠ Impossible de lire le film : ' + e.message, 'error');
+        return;
+      }
+    } else if (!url) {
+      showToast('Fichier non disponible (pas de lien Terabox ni de cache local)', 'error');
       return;
     }
   }
@@ -592,14 +635,20 @@ function downloadCurrentMovie() {
 }
 
 async function downloadById(id) {
-  const m   = movies.find(x => x.id === id);
-  let   url = fileStore[id];
-  if (!url && m?.fs_id) {
+  const m = movies.find(x => x.id === id);
+  if (!m) { showToast('Film introuvable', 'error'); return; }
+  let url = fileStore[id];
+  if (!url && m.fs_id) {
     showToast('⏳ Génération du lien...', 'info');
-    url = await tera.getDlink(m.fs_id);
-    fileStore[id] = url;
+    try {
+      url = await tera.getDlink(m.fs_id);
+      fileStore[id] = url;
+    } catch (e) {
+      showToast('⚠ Impossible de télécharger : ' + e.message, 'error'); return;
+    }
   }
   if (url) triggerDownload(url, m.name);
+  else showToast('Aucun lien disponible', 'error');
 }
 
 function triggerDownload(url, filename) {
@@ -638,6 +687,16 @@ let ffmpegInstance = null;
 
 async function loadFFmpeg() {
   if (ffmpegInstance) return ffmpegInstance;
+
+  // SharedArrayBuffer requis par FFmpeg.wasm — disponible seulement si la page
+  // tourne en contexte cross-origin isolé (COOP + COEP headers via le Service Worker).
+  // Le SW s'installe au 1er chargement mais ne contrôle la page qu'après un rechargement.
+  if (!self.crossOriginIsolated) {
+    throw new Error(
+      'FFmpeg nécessite un rechargement de la page. ' +
+      'Le Service Worker vient d\'être installé — rechargez la page et réessayez.'
+    );
+  }
 
   setProgress(0, 'Chargement de FFmpeg...');
   showToast('⏳ Chargement de FFmpeg (~30 MB, une seule fois)...', 'info');
@@ -808,14 +867,18 @@ function setProgress(pct, label) {
 
 function showConvertSuccess(url, name, size) {
   const div = document.getElementById('convertResult');
+  // Stocker l'url et le nom dans des data-attributes pour éviter les bugs
+  // avec les apostrophes/guillemets dans les noms de fichiers
   div.style.display = 'block';
   div.innerHTML = `
     <div class="result-success">
       <span class="result-icon">✓</span>
-      <span class="result-text">Conversion terminée — <strong>${name}</strong> (${formatSize(size)})</span>
-      <button class="btn btn-primary"   onclick="triggerDownload('${url}','${name}')">⬇ Télécharger</button>
-      <button class="btn btn-secondary" onclick="addConverted('${url}','${name}',${size})">☁ Ajouter & uploader</button>
+      <span class="result-text">Conversion terminée — <strong>${name.replace(/</g,'&lt;')}</strong> (${formatSize(size)})</span>
+      <button class="btn btn-primary"   id="dlConvertedBtn">⬇ Télécharger</button>
+      <button class="btn btn-secondary" id="addConvertedBtn">☁ Ajouter & uploader</button>
     </div>`;
+  document.getElementById('dlConvertedBtn').onclick  = () => triggerDownload(url, name);
+  document.getElementById('addConvertedBtn').onclick = () => addConverted(url, name, size);
 }
 
 function handleConversionError(err) {
@@ -825,9 +888,15 @@ function handleConversionError(err) {
   btn.textContent = 'Convertir en MP4'; btn.disabled = false;
   const div = document.getElementById('convertResult');
   div.style.display = 'block';
+
+  // Si le problème vient du Service Worker pas encore actif → proposer rechargement
+  const needsReload = err.message.includes('rechargement') || err.message.includes('crossOriginIsolated') || err.message.includes('SharedArrayBuffer');
   div.innerHTML = `
     <div class="result-warning">
       ⚠ Erreur : <em>${err.message}</em><br><br>
+      ${needsReload
+        ? `<button class="btn btn-blue" onclick="location.reload()" style="width:auto">🔄 Recharger la page</button>&nbsp;`
+        : ''}
       <button class="btn btn-secondary" onclick="downloadCurrentMovie()" style="width:auto">⬇ Télécharger l'original</button>
     </div>`;
 }

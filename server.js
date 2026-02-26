@@ -8,8 +8,12 @@ const express = require('express');
 const fetch   = require('node-fetch');
 const app     = express();
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Ne pas pré-parser le body pour /terabox/upload — il a son propre parser avec grande limite
+app.use((req, res, next) => {
+  if (req.path === '/terabox/upload') return next();
+  express.json()(req, res, next);
+});
+app.use(express.urlencoded({ extended: true, limit: '50gb' }));
 
 // CORS — autoriser tous les origines
 app.use((req, res, next) => {
@@ -31,6 +35,14 @@ function teraboxHeaders(ndus, browserId) {
   };
 }
 
+// Fetch avec timeout
+function fetchWithTimeout(url, opts = {}, ms = 25000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { ...opts, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
 // ── PRECREATE ─────────────────────────────────────────────────────────
 // POST /terabox/precreate
 app.post('/terabox/precreate', async (req, res) => {
@@ -44,7 +56,7 @@ app.post('/terabox/precreate', async (req, res) => {
       path, size: String(size), isdir: '0', autoinit: '1', rtype: '1',
       block_list: JSON.stringify(blockList || ['5910a591dd8fc18c32a8f3df4ad24ea8']),
     });
-    const r = await fetch(
+    const r = await fetchWithTimeout(
       `https://www.terabox.com/api/precreate?${params}`,
       { method: 'POST', headers: { ...teraboxHeaders(ndus, browserId), 'Content-Type': 'application/x-www-form-urlencoded' }, body }
     );
@@ -56,7 +68,7 @@ app.post('/terabox/precreate', async (req, res) => {
 
 // ── UPLOAD CHUNK ──────────────────────────────────────────────────────
 // POST /terabox/upload — reçoit le chunk en base64
-app.post('/terabox/upload', express.json({ limit: '150mb' }), async (req, res) => {
+app.post('/terabox/upload', express.json({ limit: '50gb' }), async (req, res) => {
   const { ndus, jsToken, appId, browserId, uploadId, path, partseq, chunkBase64, md5 } = req.body;
   try {
     // Décoder le chunk base64
@@ -77,7 +89,7 @@ app.post('/terabox/upload', express.json({ limit: '150mb' }), async (req, res) =
       partseq: String(partseq),
     });
 
-    const r = await fetch(
+    const r = await fetchWithTimeout(
       `https://c-jp.terabox.com/rest/2.0/pcs/superfile2?${params}`,
       {
         method: 'POST',
@@ -109,7 +121,7 @@ app.post('/terabox/create', async (req, res) => {
       uploadid: uploadId,
       block_list: JSON.stringify(blockList),
     });
-    const r = await fetch(
+    const r = await fetchWithTimeout(
       `https://www.terabox.com/api/create?${params}`,
       { method: 'POST', headers: { ...teraboxHeaders(ndus, browserId), 'Content-Type': 'application/x-www-form-urlencoded' }, body }
     );
@@ -129,7 +141,7 @@ app.get('/terabox/dlink', async (req, res) => {
       web: '1', channel: 'dubox', clienttype: '0',
       jsToken, dlink: '1', fsids: JSON.stringify([parseInt(fsId)]),
     });
-    const r = await fetch(
+    const r = await fetchWithTimeout(
       `https://www.terabox.com/api/filemetas?${params}`,
       { headers: teraboxHeaders(ndus, browserId) }
     );
@@ -138,7 +150,7 @@ app.get('/terabox/dlink', async (req, res) => {
     if (!dlink) return res.status(404).json({ error: 'No dlink found', raw: data });
 
     // Résoudre la redirection du dlink
-    const r2 = await fetch(dlink, {
+    const r2 = await fetchWithTimeout(dlink, {
       headers: teraboxHeaders(ndus, browserId),
       redirect: 'manual',
     });
@@ -160,7 +172,7 @@ app.get('/terabox/list', async (req, res) => {
       jsToken, dir: dir || '/',
       num: '1000', page: '1', order: 'time', desc: '1',
     });
-    const r = await fetch(
+    const r = await fetchWithTimeout(
       `https://www.terabox.com/api/list?${params}`,
       { headers: teraboxHeaders(ndus, browserId) }
     );
@@ -183,7 +195,7 @@ app.post('/terabox/delete', async (req, res) => {
       filelist: JSON.stringify(filelist),
       ondup: 'fail', async: '0', onnewver: 'fail',
     });
-    const r = await fetch(
+    const r = await fetchWithTimeout(
       `https://www.terabox.com/api/filemanager?${params}`,
       { method: 'POST', headers: { ...teraboxHeaders(ndus, browserId), 'Content-Type': 'application/x-www-form-urlencoded' }, body }
     );
@@ -202,7 +214,7 @@ app.post('/terabox/mkdir', async (req, res) => {
       web: '1', channel: 'dubox', clienttype: '0', jsToken,
     });
     const body = new URLSearchParams({ path, isdir: '1', rtype: '0' });
-    const r = await fetch(
+    const r = await fetchWithTimeout(
       `https://www.terabox.com/api/create?${params}`,
       { method: 'POST', headers: { ...teraboxHeaders(ndus, browserId), 'Content-Type': 'application/x-www-form-urlencoded' }, body }
     );
