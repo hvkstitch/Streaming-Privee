@@ -19,7 +19,7 @@ const CONFIG = {
   uploadId:  '',
   remoteDir: '/MaCinematheque',
   supabaseUrl:  'https://olhfduqnxhaoaxcxjxxi.supabase.co',
-  supabaseAnon: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
+  supabaseAnon: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9saGZkdXFueGhhb2F4Y3hqeHhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIxMDI3NTgsImV4cCI6MjA4NzY3ODc1OH0.gJokdFbBt5k9DuHBkMRtxhHcNQNJlyOjXnXMNu-Q-1k',
 };
 
 // Taille de chaque chunk d'upload : 20 MB
