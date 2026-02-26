@@ -11,24 +11,15 @@
 // =====================================================================
 
 const CONFIG = {
-  // URL de ton proxy Render (après déploiement)
-  // ex: 'https://macinema-proxy.onrender.com'
-  proxyUrl: 'https://proxy-tera-box-streaming-privee.onrender.com',
-
-  // Terabox credentials (à renouveler tous les ~30 jours)
-  // Guide : voir README ou section "Comment obtenir" plus bas
+  proxyUrl:  'https://proxy-tera-box-streaming-privee.onrender.com',
   ndus:      'Y2rf4r3teHuip84PqEcd5Q418kgZU2dOsqLd_9cM',
   jsToken:   'F3063036A4C7F1EE34E88C07B08833D5B639780B6BFE6218F4B06AEA5AE18C1CF688DF889BB329F8A87FD1E9DCE6EB20CFE668561963F1AF613B63F0336E6E6F',
   appId:     '250528',
   browserId: 'AD8vpD6GQgZiKgIIySDIDz_V__gdukEtZdGa6e8ULxWitqfiPI2dDHeAsME=',
   uploadId:  '',
-
-  // Dossier Terabox où stocker les films
   remoteDir: '/MaCinematheque',
-
-  // Supabase
   supabaseUrl:  'https://olhfduqnxhaoaxcxjxxi.supabase.co',
-  supabaseAnon: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9saGZkdXFueGhhb2F4Y3hqeHhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIxMDI3NTgsImV4cCI6MjA4NzY3ODc1OH0.gJokdFbBt5k9DuHBkMRtxhHcNQNJlyOjXnXMNu-Q-1k',
+  supabaseAnon: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
 };
 
 // Taille de chaque chunk d'upload : 20 MB
