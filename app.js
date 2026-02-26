@@ -342,6 +342,14 @@ const convertStats = {
 // =====================================================================
 
 (async function init() {
+  // Forcer la mise à jour du Service Worker si une nouvelle version est disponible
+  if ('serviceWorker' in navigator) {
+    try {
+      const reg = await navigator.serviceWorker.getRegistration('./sw.js');
+      if (reg) await reg.update();
+    } catch {}
+  }
+
   // Vérifier la config
   if (!CONFIG.ndus || !CONFIG.jsToken) {
     showConfigWarning();
