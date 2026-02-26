@@ -17,10 +17,10 @@ const CONFIG = {
 
   // Terabox credentials (à renouveler tous les ~30 jours)
   // Guide : voir README ou section "Comment obtenir" plus bas
-  ndus:      '',
-  jsToken:   '',
+  ndus:      'Y2rf4r3teHuip84PqEcd5Q418kgZU2dOsqLd_9cM',
+  jsToken:   'F3063036A4C7F1EE34E88C07B08833D5B639780B6BFE6218F4B06AEA5AE18C1CF688DF889BB329F8A87FD1E9DCE6EB20CFE668561963F1AF613B63F0336E6E6F',
   appId:     '250528',
-  browserId: '',
+  browserId: 'AD8vpD6GQgZiKgIIySDIDz_V__gdukEtZdGa6e8ULxWitqfiPI2dDHeAsME=',
   uploadId:  '',
 
   // Dossier Terabox où stocker les films
